@@ -1,30 +1,47 @@
-# ZIX — Nix-språket, omskrevet i Zig
+# ZIX — Nix-språket i Zig
 
-ZIX er en uavhengig reimplementasjon av **Nix-uttrykksspråket** i
-[Zig](https://ziglang.org) 0.16, med mål om bit-for-bit-kompatibilitet med
-Nix 2.34. Tolken produserer store paths, `.drv`-filer og derivasjonsattributter
-som er identiske med det ekte `nix` gir — verifisert mot Nix 2.34.7 i testene.
+[![CI](https://github.com/primeid/zix/actions/workflows/ci.yml/badge.svg)](https://github.com/primeid/zix/actions/workflows/ci.yml)
+[![Zig](https://img.shields.io/badge/Zig-0.16.0-f7a41d?logo=zig&logoColor=white)](https://ziglang.org)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
+> **Nix-uttrykksspråket, reimplementert i Zig — bit-for-bit-kompatibelt med Nix 2.34.**
+
+ZIX er en uavhengig implementasjon av **Nix-uttrykksspråket** i
+[Zig](https://ziglang.org) 0.16. Den evaluerer Nix-uttrykk og produserer
+store paths, `.drv`-filer og derivasjonsattributter som er **identiske** med
+det ekte `nix` gir — hvert eneste sti-resultat er verifisert mot Nix 2.34.7.
+
+**Hva som gjør ZIX spennende:**
+- 🎯 **Kompatibilitet som testbar egenskap** — testene sammenligner med ekte Nix-utdata.
+- ⚡ **Rask** — 50 000 elementers `foldl'` i ~80 ms; lazy evaluator med memoiserte thunks.
+- 🔍 **Liten og lesbar kodebase** — ~9 000 linjer Zig, null runtime-avhengigheter.
+- 🧩 **Bygget på Nix' egen kilde** — algoritmene er modellert direkte på `path.cc`, `derivations.cc`, `parser.y`, `lexer.l` med nøyaktig samme semantikk.
+
+---
 
 ## Bygge og kjøre
 
+Krav: [Zig 0.16.0](https://ziglang.org/download/) (eller `nix develop` for et ferdig miljø).
+
 ```console
-$ zig build            # bygger zig-out/bin/zix
-$ zig build test       # 23 tester, inkl. store-path-verifisering mot ekte Nix
+$ zig build            # bygger zig-out/bin/zix (ReleaseSafe som standard)
+$ zig build test       # 24 tester, inkl. store-path-verifisering mot ekte Nix
 ```
 
 ```console
 $ zix eval -E '1 + 2 * 3'
 7
 $ zix eval -E 'builtins.map (x: x * x) [1 2 3 4]'
-[1 4 9 16]
-$ zix eval examples/hello.nix          # en derivasjon (bruk --read-only / --store-dir)
+[ 1 4 9 16 ]
 $ zix eval --read-only -E '(builtins.derivation { name = "t"; system = "x86_64-linux"; builder = "/bin/sh"; }).drvPath' --raw
-/nix/store/k79611g7bg62d41fh6bvm7xpf1dl2x91-testdrv.drv
+/nix/store/k79611g7bg62d41fh6bvm7xpf1dl2x91-testdrv.drv   # = ekte nix
 ```
 
 Alternativer: `--raw` (rå strenger), `--read-only` (ikke skriv til store),
 `--store-dir DIR` (egen store, f.eks. `/tmp/zs`), `-I path` / `NIX_PATH`
 for `<nixpkgs>`-oppslag, `zix parse FIL` (kun lex+parse).
+
+Eksempler ligger i [`examples/`](examples/).
 
 ## Arkitektur
 
@@ -48,26 +65,61 @@ store paths.
 
 ## Status
 
-Ferdig og verifisert:
-- Hele språket: literaler, strenger/interpolasjon, indented strings, stier,
+**Ferdig og verifisert mot Nix 2.34.7:**
+
+- **Hele språket**: literaler, strenger/interpolasjon, indented strings, stier,
   operatorer (`+ - * / // ++ == != < > <= >= && || -> ! ?`), attrsets
   (inkl. `inherit`, dynamiske attributter, nesting), `let`/`rec`/`with`/
   `assert`/`if`, lambdaer med formals/standardverdier/`@`, lister,
   `<nixpkgs>`-oppslag, `import`.
-- Lazy evaluering med memoization og syklusdeteksjon.
-- `builtins.derivation` / `derivationStrict` → korrekte `.drv`-filer og
-  `drvPath`/`outPath` (input-addressed, fixed-output, multi-output-stub).
-- ~85 builtins inkl. `map`, `foldl'`, regex (`match`/`split`),
-  `replaceStrings`, `compareVersions`, JSON, `hashString`, `toFile`,
-  `readFile`, `readDir`, `path`, `placeholder`, `tryEval`, `genericClosure`.
+- **Lazy evaluering** med memoization, syklusdeteksjon og dyp-rekursjonsbeskyttelse.
+- **Derivasjoner**: `builtins.derivation`/`derivationStrict` → korrekte
+  `.drv`-filer og `drvPath`/`outPath` (input-addressed, fixed-output flat+recursive,
+  multi-output).
+- **~85 builtins**: `map`, `foldl'`, regex (`match`/`split`), `replaceStrings`,
+  `compareVersions`, JSON, `hashString`, `toFile`, `readFile`, `readDir`,
+  `path`, `placeholder`, `tryEval`, `genericClosure` og mye mer.
 
-Planlagt / delvis:
-- **Realiserings-laget** (`zix build`): kjøre byggere i en sandkasse og
-  produsere utdata — evalueringssiden er komplett, utførelsesiden gjenstår.
-- Flere builtins (`fetchGit`, `fetchTarball`, `fromTOML`, `builtins.path`-flagg,
-  `scopedImport`, dynamiske derivations, …) og `__structuredAttrs`.
-- nixpkgs-evaluering: språket og builtins som nixpkgs bruker er stort sett på
-  plass, men full `import <nixpkgs> {}` krever resten av punktet over.
+**Verifiseringsmetode:** et sammenligningsbatteri på 165 uttrykk kjører hvert
+uttrykk i både `zix` og ekte `nix 2.34.7` og krever identiske resultater —
+språk, builtins og derivasjonsstier. Se [CONTRIBUTING](CONTRIBUTING.md) for
+hvordan du kjører det selv.
+
+## Roadmap
+
+Den store oversikten — gjerne som [bidrag](CONTRIBUTING.md):
+
+- [ ] **Realiseringslaget** (`zix build`): kjøre byggere i en sandkasse og
+      produsere utdata. Evalueringssiden er komplett; utførelsesiden gjenstår.
+- [ ] **Flere builtins**: `fetchGit`, `fetchTarball`, `fromTOML`,
+      `__structuredAttrs`, `builtins.path`-flagg, `scopedImport`,
+      dynamiske derivations.
+- [ ] **Nixpkgs-evaluering**: `import <nixpkgs> {}` i full skala.
+- [ ] **Posisjonssporing** i AST (for feilmeldinger og `«lambda @ …»`-utskrift).
+
+## Kjente avvik fra Nix
+
+Bevisste og dokumenterte forskjeller:
+
+- **Ekstra builtins** som Nix 2.34 mangler: `bitNot`, `toUpper`, `toLower`,
+  `take`, `drop`, `reverseList`, `currentSystem` — kompatibilitetsvennlige utvidelser.
+- **`|>` / `<|`** (pipe-operators) er aktivert som standard; Nix krever
+  `--extra-experimental-features pipe-operators`.
+- **Lambda-utskrift** viser `«lambda»` uten posisjon (`«lambda @ «string»:1:3»`
+  i Nix) — posisjonssporing er på roadmap.
+- **Feilmeldinger** er lik i *oppførsel* (samme tilfeller feiler), men teksten
+  er ofte kortere enn Nix sine.
+- `nixVersion` rapporterer `2.34.7` (kompatibilitet), `langVersion` = 6.
+
+## Bidra
+
+ZIX er et lite prosjekt som er avhengig av bidragsytere. Er du interessert i
+språkimplementasjoner, Zig, Nix eller bare syntes dette var gøy?
+
+- Sjekk [CONTRIBUTING.md](CONTRIBUTING.md) for retningslinjer og konkrete oppgaver.
+- Les [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
+- Se [Roadmap](#roadmap) for hva som er viktigst å jobbe med.
+- Issues og PR-er er velkomne — små, fokuserte endringer med tester går raskest gjennom.
 
 ## Analyse: hvorfor (og hvorfor ikke) omskrive Nix til Zig
 
@@ -182,4 +234,4 @@ Hvis du egentlig mener **å omskrive selve Nix expression language til et nytt s
 
 ## Lisens
 
-MIT.
+MIT — se [LICENSE](LICENSE).

@@ -774,7 +774,7 @@ pub fn canonPath(alloc: std.mem.Allocator, path: []const u8) ParseError![]const 
     }
     if (absolute) {
         if (segs.items.len == 0) return "/";
-        return std.mem.join(alloc, "/", segs.items);
+        return std.fmt.allocPrint(alloc, "/{s}", .{std.mem.join(alloc, "/", segs.items) catch return error.OutOfMemory});
     }
     if (segs.items.len == 0) return ".";
     return std.mem.join(alloc, "/", segs.items);

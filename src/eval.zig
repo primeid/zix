@@ -694,7 +694,7 @@ pub const EvalState = struct {
         try self.force(v);
         switch (v.*) {
             .int => |i| return std.fmt.allocPrint(self.alloc, "{d}", .{i}),
-            .float => |f| return std.fmt.allocPrint(self.alloc, "{d}", .{f}),
+            .float => |f| return std.fmt.allocPrint(self.alloc, "{d:.6}", .{f}),
             .bool_ => |b| return if (b) "1" else "",
             .null_ => return "",
             .string => |s| {

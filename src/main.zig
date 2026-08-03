@@ -85,7 +85,10 @@ pub fn main(init: std.process.Init) !void {
 
     var result: value.Value = undefined;
     if (expr_mode) {
-        const parsed = st.parse(target_str, "<command-line>") catch |e| {
+        const cwd = fsutilRealpathCwd(a);
+        const vfile = try std.fmt.allocPrint(a, "{s}/<command-line>", .{cwd});
+        if (init.environ_map.get("ZIX_DEBUG") != null) std.debug.print("vfile: {s}\n", .{vfile});
+        const parsed = st.parse(target_str, vfile) catch |e| {
             std.debug.print("zix: parse error: {s}\n", .{@errorName(e)});
             std.process.exit(1);
         };
@@ -114,6 +117,10 @@ fn exitEvalError(e: anyerror, st: *eval.EvalState) noreturn {
         std.debug.print("zix: error: {s}\n", .{@errorName(e)});
     }
     std.process.exit(1);
+}
+
+fn fsutilRealpathCwd(a: std.mem.Allocator) []const u8 {
+    return zix.fsutil.readLinkAlloc(a, "/proc/self/cwd") catch ".";
 }
 
 fn readFileOrExit(a: std.mem.Allocator, path: []const u8) []const u8 {
@@ -203,12 +210,12 @@ fn printValueSeen(
             }
         },
         .list => |l| {
-            try w.append('[');
+            try w.appendSlice("[ ");
             for (l, 0..) |e, i| {
                 if (i > 0) try w.append(' ');
                 try printValueSeen(st, e, w, depth + 1, raw, seen);
             }
-            try w.append(']');
+            try w.appendSlice(" ]");
         },
         .attrs => |a| {
             for (seen) |s2| {

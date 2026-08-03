@@ -41,12 +41,12 @@ fn printTest(st: *eval.EvalState, v: *value.Value, w: *std.array_list.Managed(u8
         .string => |s| try w.appendSlice(s.s),
         .path => |p| try w.appendSlice(p.p),
         .list => |l| {
-            try w.append('[');
+            try w.appendSlice("[ ");
             for (l, 0..) |e, i| {
                 if (i > 0) try w.append(' ');
                 try printTest(st, e, w, depth + 1);
             }
-            try w.append(']');
+            try w.appendSlice(" ]");
         },
         .attrs => |a| {
             try w.appendSlice("{ ");
@@ -85,7 +85,7 @@ test "eval: arithmetic and operators" {
     try expectEval(a, "1 < 2", "true");
     try expectEval(a, "2 >= 2", "true");
     try expectEval(a, "1 == 1.0", "true");
-    try expectEval(a, "[1 2] ++ [3]", "[1 2 3]");
+    try expectEval(a, "[1 2] ++ [3]", "[ 1 2 3 ]");
     try expectEval(a, "{ a = 1; } // { b = 2; }", "{ a = 1; b = 2; }");
     try expectEval(a, "{ a = 1; } // { a = 2; }", "{ a = 2; }");
 }
@@ -106,7 +106,7 @@ test "eval: strings and interpolation" {
 test "eval: toString float" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    try expectEval(arena.allocator(), "builtins.toString 2.5", "2.5");
+    try expectEval(arena.allocator(), "builtins.toString 2.5", "2.500000");
 }
 
 test "eval: let/rec/with/functions" {
@@ -124,17 +124,17 @@ test "eval: let/rec/with/functions" {
     try expectEval(a, "if 1 < 2 then \"yes\" else \"no\"", "yes");
     try expectEval(a, "assert 1 == 1; 5", "5");
     try expectEval(a, "let xs = [1 2 3]; in builtins.foldl' (a: b: a + b) 0 xs", "6");
-    try expectEval(a, "builtins.genList (x: x * x) 4", "[0 1 4 9]");
+    try expectEval(a, "builtins.genList (x: x * x) 4", "[ 0 1 4 9 ]");
 }
 
 test "eval: builtins" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    try expectEval(a, "builtins.map (x: x * 2) [1 2 3]", "[2 4 6]");
-    try expectEval(a, "builtins.filter (x: x > 1) [1 2 3]", "[2 3]");
-    try expectEval(a, "builtins.attrNames { b = 1; a = 2; }", "[a b]");
-    try expectEval(a, "builtins.attrValues { a = 1; b = 2; }", "[1 2]");
+    try expectEval(a, "builtins.map (x: x * 2) [1 2 3]", "[ 2 4 6 ]");
+    try expectEval(a, "builtins.filter (x: x > 1) [1 2 3]", "[ 2 3 ]");
+    try expectEval(a, "builtins.attrNames { b = 1; a = 2; }", "[ a b ]");
+    try expectEval(a, "builtins.attrValues { a = 1; b = 2; }", "[ 1 2 ]");
     try expectEval(a, "builtins.getAttr \"a\" { a = 1; }", "1");
     try expectEval(a, "builtins.hasAttr \"a\" { a = 1; }", "true");
     try expectEval(a, "builtins.removeAttrs { a = 1; b = 2; } [\"a\"]", "{ b = 2; }");
@@ -149,15 +149,15 @@ test "eval: builtins" {
     try expectEval(a, "builtins.toLower \"ABC\"", "abc");
     try expectEval(a, "builtins.concatStringsSep \",\" [\"a\" \"b\" \"c\"]", "a,b,c");
     try expectEval(a, "builtins.replaceStrings [\"a\"] [\"b\"] \"aaa\"", "bbb");
-    try expectEval(a, "builtins.splitVersion \"1.2.3pre\"", "[1 2 3 pre]");
+    try expectEval(a, "builtins.splitVersion \"1.2.3pre\"", "[ 1 2 3 pre ]");
     try expectEval(a, "builtins.parseDrvName \"foo-1.2.3\"", "{ name = foo; version = 1.2.3; }");
     try expectEval(a, "builtins.compareVersions \"2.3.1\" \"2.3a\"", "1");
     try expectEval(a, "builtins.hashString \"sha256\" \"hello\"", "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824");
     try expectEval(a, "builtins.toJSON { a = [1 2]; }", "{\"a\":[1,2]}");
     try expectEval(a, "builtins.fromJSON \"{\\\"a\\\":1}\"", "{ a = 1; }");
     try expectEval(a, "builtins.listToAttrs [{ name = \"a\"; value = 1; }]", "{ a = 1; }");
-    try expectEval(a, "builtins.groupBy (x: if x > 0 then \"pos\" else \"neg\") [1 (-1) 2]", "{ neg = [-1]; pos = [1 2]; }");
-    try expectEval(a, "builtins.genericClosure { startSet = [{ key = 1; }]; operator = x: []; }", "[{ key = 1; }]");
+    try expectEval(a, "builtins.groupBy (x: if x > 0 then \"pos\" else \"neg\") [1 (-1) 2]", "{ neg = [ -1 ]; pos = [ 1 2 ]; }");
+    try expectEval(a, "builtins.genericClosure { startSet = [{ key = 1; }]; operator = x: []; }", "[ { key = 1; } ]");
 }
 
 test "eval: store paths match real Nix 2.34.7" {

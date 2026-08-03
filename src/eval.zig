@@ -855,7 +855,8 @@ pub const EvalState = struct {
         const toks = lx.lexAll() catch |e| {
             return self.userError("parse error in '{s}': {s}", .{ file, @errorName(e) });
         };
-        const base_dir = std.fs.path.dirname(file) orelse self.home_dir;
+        const dirname = std.fs.path.dirname(file) orelse "";
+        const base_dir = if (dirname.len > 0) dirname else ".";
         var p = parser.Parser.init(self.alloc, toks, base_dir, self.home_dir);
         return p.parse() catch |e| {
             return self.userError("parse error in '{s}': {s}", .{ file, @errorName(e) });

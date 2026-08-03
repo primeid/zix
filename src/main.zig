@@ -96,7 +96,11 @@ pub fn main(init: std.process.Init) !void {
 
     var w = std.array_list.Managed(u8).init(a);
     printValue(st, &result, &w, 0, raw) catch |e| {
-        std.debug.print("zix: error printing value: {s}\n", .{@errorName(e)});
+        if (st.err_msg.len > 0) {
+            std.debug.print("zix: error printing value: {s}\n", .{st.err_msg});
+        } else {
+            std.debug.print("zix: error printing value: {s}\n", .{@errorName(e)});
+        }
         std.process.exit(1);
     };
     try w.append('\n');

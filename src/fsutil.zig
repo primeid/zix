@@ -21,11 +21,11 @@ pub fn statPath(path: []const u8) !Stat {
     } else |_| {}
     const st = try std.Io.Dir.cwd().statFile(io, path, .{});
     var executable = false;
-    _ = std.Io.Dir.accessAbsolute(io, path, .{ .execute = true }) catch |e| switch (e) {
+    _ = std.Io.Dir.cwd().access(io, path, .{ .execute = true }) catch |e| switch (e) {
         error.AccessDenied => {},
         else => {},
     };
-    if (std.Io.Dir.accessAbsolute(io, path, .{ .execute = true })) |_| {
+    if (std.Io.Dir.cwd().access(io, path, .{ .execute = true })) |_| {
         executable = true;
     } else |_| {}
     return .{

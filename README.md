@@ -69,6 +69,117 @@ Planlagt / delvis:
 - nixpkgs-evaluering: språket og builtins som nixpkgs bruker er stort sett på
   plass, men full `import <nixpkgs> {}` krever resten av punktet over.
 
+## Analyse: hvorfor (og hvorfor ikke) omskrive Nix til Zig
+
+Følgende er en gjennomgang av fordeler, kostnader og risiko ved å omskrive
+Nix-språket/implementasjonen fra C++/OCaml til Zig — tatt med i sin helhet.
+
+Hvis du mener **å omskrive Nix-språket eller Nix evaluator/implementasjonen fra C++/OCaml til Zig**, er det flere mulige fordeler, men også betydelige kostnader.
+
+### Mulige fordeler med Zig
+
+| Område                    | Potensiell fordel                                                                                                                     |
+| ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| **Ytelse**                | Lavt overhead og god kontroll over minne og datastrukturer kan gi raskere evaluering og mindre ressursbruk.                           |
+| **Minnebruk**             | Eksplisitt minnehåndtering og allocators gjør det mulig å optimalisere minneforbruket mer presist.                                    |
+| **Enklere kodebase**      | Zig har et relativt lite og konsistent språk sammenlignet med C++ og kan redusere kompleksiteten i implementasjonen.                  |
+| **Portabilitet**          | Zig har svært god cross-compilation og kan gjøre det enklere å bygge Nix-komponenter for Linux, macOS, Windows og andre plattformer.  |
+| **C-interoperabilitet**   | Zig kan integreres direkte med C-biblioteker uten behov for et omfattende FFI-lag. Dette er relevant for Nix' eksisterende økosystem. |
+| **Feilhåndtering**        | Zig har eksplisitt error handling, som kan gjøre kritiske deler av evaluator- og build-systemkoden lettere å følge.                   |
+| **Færre avhengigheter**   | Zig-kompilatoren er relativt selvstendig og kan potensielt gjøre bootstrap og distribusjon enklere.                                   |
+| **Sikkerhet**             | Selv om Zig ikke er memory-safe på samme måte som Rust, gir språket bedre verktøy for å oppdage enkelte feil enn tradisjonell C/C++.  |
+| **Utviklerproduktivitet** | En mindre og mer moderne språkmodell kan gjøre det lettere for nye utviklere å bidra enn en stor C++-kodebase.                        |
+
+### Den største potensielle gevinsten
+
+Jeg tror den mest interessante fordelen ikke nødvendigvis er **rå ytelse**, men **vedlikeholdbarhet og portabilitet**.
+
+Nix er i praksis flere ting samtidig:
+
+```text
+Nix language
+     │
+     ▼
+Parser
+     │
+     ▼
+AST / evaluator
+     │
+     ▼
+Derivations
+     │
+     ▼
+Store / builds
+     │
+     ▼
+Sandboxing
+     │
+     ▼
+Binary caches / deployment
+```
+
+Hvis den sentrale implementasjonen ble skrevet i Zig, kunne man potensielt få en **mindre, mer homogen og lettere porterbar runtime**. Det kunne gjøre det enklere å kjøre Nix-komponenter på flere plattformer og bygge dem fra kildekode.
+
+### Men: Zig løser ikke nødvendigvis Nix' største problemer
+
+Det er viktig å skille mellom:
+
+**Nix-språket som språk**
+og
+**Nix som komplett system**.
+
+Hvis problemet er for eksempel:
+
+* langsom evaluering
+* dårlig feilhåndtering
+* komplisert kodebase
+* vanskelig debugging
+* dårlig Windows-støtte
+* høy ressursbruk
+
+kan Zig potensielt hjelpe.
+
+Men hvis problemet er:
+
+* kompleksiteten i Nix expression language
+* laziness
+* hermetiske builds
+* dependency graphs
+* reproducibility
+* flakes
+* UX
+* Nixpkgs' enorme kompleksitet
+
+så vil en omskriving til Zig **ikke automatisk løse dette**. Da flyttes problemene bare til en ny implementasjon.
+
+### Min vurdering
+
+Hvis målet var å modernisere Nix, ville jeg **ikke skrevet hele Nix på nytt i Zig fra dag én**. Jeg ville vurdert en gradvis arkitektur:
+
+```text
+              Existing Nix
+                   │
+        ┌──────────┴──────────┐
+        │                     │
+   Existing code          New Zig components
+                              │
+                    ┌─────────┼─────────┐
+                    │         │         │
+                 Parser    Evaluator   Store
+                    │         │         │
+                    └─────────┴─────────┘
+                              │
+                       Compatibility
+                              │
+                         Nix ecosystem
+```
+
+Da kunne man først skrive **en ny evaluator i Zig**, benchmarke den mot dagens Nix og gradvis erstatte komponenter dersom fordelene faktisk materialiserer seg.
+
+**Kort sagt:** Zig kan potensielt gi Nix **lavere ressursbruk, enklere cross-compilation, en mer håndterbar implementasjon og bedre kontroll over runtime-ytelse**. Den største risikoen er at man bruker mange år på å omskrive et enormt og komplekst system uten å løse de underliggende problemene som faktisk gjør Nix vanskelig.
+
+Hvis du egentlig mener **å omskrive selve Nix expression language til et nytt språk med Zig som implementasjonsspråk**, er analysen ganske annerledes. Da kan jeg også sammenligne **Nix vs. en hypotetisk "Zig-Nix"** arkitektur, inkludert hvordan man kunne bevare bakoverkompatibilitet med Nixpkgs.
+
 ## Lisens
 
 MIT.

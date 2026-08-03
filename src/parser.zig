@@ -345,7 +345,9 @@ pub const Parser = struct {
             },
             .uri => {
                 _ = self.advance();
-                return self.allocExpr(.{ .str = .{ .parts = &.{.{ .lit = t.text }}, .kind = .dquote } });
+                const parts = try self.alloc.alloc(ast.Part, 1);
+                parts[0] = .{ .lit = t.text };
+                return self.allocExpr(.{ .str = .{ .parts = parts, .kind = .dquote } });
             },
             .spath => {
                 _ = self.advance();
@@ -580,7 +582,11 @@ pub const Parser = struct {
         try parts.append(try self.allocExpr(.{ .path = resolved }));
         for (t.parts[1..]) |p| {
             switch (p) {
-                .lit => |l| try parts.append(try self.allocExpr(.{ .str = .{ .parts = &.{.{ .lit = l.text }}, .kind = .dquote } })),
+                .lit => |l| {
+                    const lit_parts = try self.alloc.alloc(ast.Part, 1);
+                    lit_parts[0] = .{ .lit = l.text };
+                    try parts.append(try self.allocExpr(.{ .str = .{ .parts = lit_parts, .kind = .dquote } }));
+                },
                 .interp => |ts| try parts.append(try self.parseSub(ts)),
             }
         }

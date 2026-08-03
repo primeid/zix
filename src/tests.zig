@@ -95,7 +95,7 @@ test "eval: strings and interpolation" {
     defer arena.deinit();
     const a = arena.allocator();
     try expectEval(a, "\"a\" + \"b\"", "ab");
-    try expectEval(a, "let x = 42; in \"value: ${x}\"", "value: 42");
+    try expectEval(a, "let x = toString 42; in \"value: ${x}\"", "value: 42");
     try expectEval(a, "''\n  hello\n  world\n''", "hello\nworld\n");
     try expectEval(a, "''  a''$b''", "a$b");
     try expectEval(a, "\"\\${not-interpolated}\"", "${not-interpolated}");
@@ -191,6 +191,21 @@ test "eval: store paths match real Nix 2.34.7" {
         "let f = builtins.toFile \"greeting\" \"hello\"; in (builtins.derivation { name = \"uses-greeting\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; src = f; }).outPath",
         "/nix/store/ariwhq56zgfg4wd1qgkc6b1lh3qklmdh-uses-greeting",
     );
+}
+
+test "eval: strict interpolation (Nix 2.3x)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // Nix 2.34 does not coerce non-strings in interpolation
+    const st = try newState(a);
+    defer st.deinit();
+    const parsed = try st.parse("\"${42}\"", "<test>");
+    _ = st.eval(parsed, st.base_env, 0) catch {
+        try std.testing.expect(true);
+        return;
+    };
+    return error.TestExpectedEqual;
 }
 
 test "eval: laziness" {

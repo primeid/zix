@@ -55,6 +55,8 @@ pub fn main(init: std.process.Init) !void {
             mode = .parse;
         } else if (std.mem.eql(u8, arg, "eval")) {
             mode = .eval;
+        } else if (target == null and expr_mode) {
+            target = arg; // expression following -E (may start with '-')
         } else if (std.mem.startsWith(u8, arg, "-")) {
             std.debug.print("zix: unknown option '{s}'\n", .{arg});
             std.process.exit(1);
@@ -83,31 +85,49 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    var result: value.Value = undefined;
+    var output = std.array_list.Managed(u8).init(a);
+    const RunCtx = struct {
+        st: *eval.EvalState,
+        parsed: *const zix.ast.Expr,
+        output: *std.array_list.Managed(u8),
+        raw: bool,
+    };
+    // Evaluate AND print on a thread with a large stack: deep forcing of
+    // the (lazy) result must not overflow the small main-thread stack.
+    const run_eval = struct {
+        fn f(ctx: RunCtx) void {
+            var result = ctx.st.eval(ctx.parsed, ctx.st.base_env, 0) catch |e| exitEvalError(e, ctx.st);
+            printValue(ctx.st, &result, ctx.output, 0, ctx.raw) catch |e| {
+                if (ctx.st.err_msg.len > 0) {
+                    std.debug.print("zix: error printing value: {s}\n", .{ctx.st.err_msg});
+                } else {
+                    std.debug.print("zix: error printing value: {s}\n", .{@errorName(e)});
+                }
+                std.process.exit(1);
+            };
+        }
+    }.f;
     if (expr_mode) {
         const cwd = fsutilRealpathCwd(a);
         const vfile = try std.fmt.allocPrint(a, "{s}/<command-line>", .{cwd});
-        if (init.environ_map.get("ZIX_DEBUG") != null) std.debug.print("vfile: {s}\n", .{vfile});
         const parsed = st.parse(target_str, vfile) catch |e| {
-            std.debug.print("zix: parse error: {s}\n", .{@errorName(e)});
+            if (st.err_msg.len > 0) {
+                std.debug.print("zix: parse error: {s}\n", .{st.err_msg});
+            } else {
+                std.debug.print("zix: parse error: {s}\n", .{@errorName(e)});
+            }
             std.process.exit(1);
         };
-        result = st.eval(parsed, st.base_env, 0) catch |e| exitEvalError(e, st);
+        const t = try std.Thread.spawn(.{ .stack_size = 1 << 30 }, run_eval, .{ RunCtx{ .st = st, .parsed = parsed, .output = &output, .raw = raw } });
+        t.join();
     } else {
-        result = st.importPath(target_str) catch |e| exitEvalError(e, st);
+        const parsed = st.parseFile(target_str) catch |e| exitEvalError(e, st);
+        const t = try std.Thread.spawn(.{ .stack_size = 1 << 30 }, run_eval, .{ RunCtx{ .st = st, .parsed = parsed, .output = &output, .raw = raw } });
+        t.join();
     }
 
-    var w = std.array_list.Managed(u8).init(a);
-    printValue(st, &result, &w, 0, raw) catch |e| {
-        if (st.err_msg.len > 0) {
-            std.debug.print("zix: error printing value: {s}\n", .{st.err_msg});
-        } else {
-            std.debug.print("zix: error printing value: {s}\n", .{@errorName(e)});
-        }
-        std.process.exit(1);
-    };
-    try w.append('\n');
-    writeStdout(w.items);
+    try output.append('\n');
+    writeStdout(output.items);
 }
 
 fn exitEvalError(e: anyerror, st: *eval.EvalState) noreturn {
@@ -140,6 +160,14 @@ fn parseNixPath(
     extra: []const []const u8,
 ) ![]const eval.NixPathEntry {
     var entries = std.array_list.Managed(eval.NixPathEntry).init(a);
+    // -I entries take priority over NIX_PATH, like `nix`.
+    for (extra) |entry| {
+        if (std.mem.indexOfScalar(u8, entry, '=')) |eq| {
+            try entries.append(.{ .prefix = entry[0..eq], .path = entry[eq + 1 ..] });
+        } else {
+            try entries.append(.{ .prefix = "", .path = entry });
+        }
+    }
     if (environ.get("NIX_PATH")) |np| {
         var it = std.mem.tokenizeScalar(u8, np, ':');
         while (it.next()) |entry| {
@@ -148,13 +176,6 @@ fn parseNixPath(
             } else {
                 try entries.append(.{ .prefix = "", .path = entry });
             }
-        }
-    }
-    for (extra) |entry| {
-        if (std.mem.indexOfScalar(u8, entry, '=')) |eq| {
-            try entries.append(.{ .prefix = entry[0..eq], .path = entry[eq + 1 ..] });
-        } else {
-            try entries.append(.{ .prefix = "", .path = entry });
         }
     }
     return entries.items;
@@ -188,14 +209,21 @@ fn printValueSeen(
                 try w.appendSlice(s.s);
             } else {
                 try w.append('"');
-                for (s.s) |c| {
+                for (s.s, 0..) |c, idx| {
                     switch (c) {
                         '"' => try w.appendSlice("\\\""),
                         '\\' => try w.appendSlice("\\\\"),
                         '\n' => try w.appendSlice("\\n"),
                         '\t' => try w.appendSlice("\\t"),
                         '\r' => try w.appendSlice("\\r"),
-                        '$' => try w.appendSlice("\\$"),
+                        // escape '$' before '{' so the output round-trips
+                        '$' => {
+                            if (idx + 1 < s.s.len and s.s[idx + 1] == '{') {
+                                try w.appendSlice("\\$");
+                            } else {
+                                try w.append(c);
+                            }
+                        },
                         else => try w.append(c),
                     }
                 }
@@ -210,6 +238,10 @@ fn printValueSeen(
             }
         },
         .list => |l| {
+            if (l.len == 0) {
+                try w.appendSlice("[ ]");
+                return;
+            }
             try w.appendSlice("[ ");
             for (l, 0..) |e, i| {
                 if (i > 0) try w.append(' ');
@@ -224,6 +256,27 @@ fn printValueSeen(
                     return;
                 }
             }
+            // derivations print as «derivation <drvPath>» like real nix
+            if (a.find("type")) |tv| {
+                var t = tv.*;
+                try st.force(&t);
+                if (t == .string and std.mem.eql(u8, t.string.s, "derivation")) {
+                    if (a.find("drvPath")) |dv| {
+                        var d = dv.*;
+                        try st.force(&d);
+                        if (d == .string) {
+                            try w.appendSlice("«derivation ");
+                            try w.appendSlice(d.string.s);
+                            try w.appendSlice("»");
+                            return;
+                        }
+                    }
+                }
+            }
+            if (a.items.len == 0) {
+                try w.appendSlice("{ }");
+                return;
+            }
             try w.appendSlice("{ ");
             const new_seen = try st.alloc.alloc(*const value.Attrs, seen.len + 1);
             @memcpy(new_seen[0..seen.len], seen);
@@ -235,8 +288,12 @@ fn printValueSeen(
             }
             try w.appendSlice("; }");
         },
-        .lambda => try w.appendSlice("<LAMBDA>"),
-        .builtin => try w.appendSlice("<PRIMOP>"),
+        .lambda => try w.appendSlice("«lambda»"),
+        .builtin => |b| {
+            try w.appendSlice("«primop ");
+            try w.appendSlice(b.name);
+            try w.append('»');
+        },
         .thunk => unreachable,
     }
 }

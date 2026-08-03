@@ -47,6 +47,10 @@ pub const EvalState = struct {
     base_env: *Env,
     /// message for UserError
     err_msg: []const u8 = "",
+    /// kind of the current user error (for builtins.tryEval)
+    err_kind: enum { none, assert, thrown, other } = .none,
+    /// nested evaluation depth (guards against stack overflow)
+    call_depth: usize = 0,
     /// current file being evaluated (for __curPos / import paths)
     cur_file: []const u8 = "",
     /// import cache: path → parsed expr
@@ -84,6 +88,13 @@ pub const EvalState = struct {
 
     pub fn userError(self: *EvalState, comptime fmt: []const u8, args: anytype) EvalError {
         self.err_msg = std.fmt.allocPrint(self.alloc, fmt, args) catch return error.OutOfMemory;
+        self.err_kind = .other;
+        return error.UserError;
+    }
+
+    pub fn userErrorKind(self: *EvalState, kind: @TypeOf(self.err_kind), comptime fmt: []const u8, args: anytype) EvalError {
+        self.err_msg = std.fmt.allocPrint(self.alloc, fmt, args) catch return error.OutOfMemory;
+        self.err_kind = kind;
         return error.UserError;
     }
 
@@ -143,13 +154,19 @@ pub const EvalState = struct {
     // ------------------------------------------------------------------
 
     pub fn lookup(self: *EvalState, env: *Env, name: []const u8) EvalError!*Value {
+        // Nix resolves variables statically: lexical bindings always take
+        // precedence over `with` scopes.  Emulate with two passes: first the
+        // lexical chain, then `with` frames (innermost first).
         var e: ?*Env = env;
         while (e) |env_frame| {
             for (env_frame.vars) |v| {
                 if (std.mem.eql(u8, v.name, name)) return v.value;
             }
+            e = env_frame.parent;
+        }
+        e = env;
+        while (e) |env_frame| {
             if (env_frame.with) |wv| {
-                // with: search the attrset
                 try self.force(wv);
                 if (wv.* == .attrs) {
                     if (wv.attrs.find(name)) |item| return item;
@@ -165,12 +182,19 @@ pub const EvalState = struct {
     // ------------------------------------------------------------------
 
     pub fn eval(self: *EvalState, expr: *const ast.Expr, env: *Env, pos: usize) EvalError!Value {
+        self.call_depth += 1;
+        defer self.call_depth -= 1;
+        if (self.call_depth > 50000) {
+            return self.userError("stack overflow (possible infinite recursion)", .{});
+        }
         switch (expr.*) {
             .int => |i| return .{ .int = i },
             .float => |f| return .{ .float = f },
             .path => |p| return .{ .path = .{ .p = p } },
             .pos => {
-                // __curPos
+                // __curPos: null when no file position is available
+                // (command-line expressions), like Nix.
+                if (self.cur_file.len == 0) return .null_;
                 const items = try self.alloc.alloc(Item, 2);
                 items[0] = .{ .name = "file", .value = try self.alloc.create(Value) };
                 items[0].value.* = self.mkString(self.cur_file, &.{});
@@ -190,7 +214,7 @@ pub const EvalState = struct {
                         .lit => |lit| try out.appendSlice(lit),
                         .interp => |e| {
                             var v = try self.evalAndForce(e, env, pos);
-                            const t = try self.coerceToString(&v, &ctx, false, "while evaluating a path segment");
+                            const t = try self.coerceToString(&v, &ctx, false, false, "while evaluating a path segment");
                             try out.appendSlice(t);
                         },
                     }
@@ -205,7 +229,10 @@ pub const EvalState = struct {
                 var base = try self.eval(sel.base, env, pos);
                 try self.force(&base);
                 var cur: *Value = &base;
+                var first = true;
                 for (sel.attrs) |elem| {
+                    if (!first) try self.force(cur);
+                    first = false;
                     const name: []const u8 = switch (elem) {
                         .static => |n| n,
                         .dyn => |e| blk: {
@@ -232,7 +259,10 @@ pub const EvalState = struct {
                 var base = try self.eval(ha.base, env, pos);
                 try self.force(&base);
                 var cur: *Value = &base;
+                var first = true;
                 for (ha.attrs) |elem| {
+                    if (!first) try self.force(cur);
+                    first = false;
                     const name: []const u8 = switch (elem) {
                         .static => |n| n,
                         .dyn => |e| blk: {
@@ -326,7 +356,9 @@ pub const EvalState = struct {
                 const all_binds = try self.alloc.alloc(ast.AttrBind, lr.binds.len + 1);
                 @memcpy(all_binds[0..lr.binds.len], lr.binds);
                 const body_bind = try self.alloc.create(ast.AttrBind);
-                body_bind.* = .{ .path = &.{.{ .static = "body" }}, .value = lr.body, .inherit_from = null };
+                const body_path = try self.alloc.alloc(ast.AttrElem, 1);
+                body_path[0] = .{ .static = "body" };
+                body_bind.* = .{ .path = body_path, .value = lr.body, .inherit_from = null };
                 all_binds[lr.binds.len] = body_bind.*;
                 const aset_val = try self.evalAttrset(all_binds, true, env, pos);
                 if (aset_val != .attrs) return error.BadType;
@@ -353,7 +385,7 @@ pub const EvalState = struct {
             .assert_ => |a| {
                 const cond = try self.evalBool(a.cond, env, pos, "in the assertion");
                 if (!cond) {
-                    return self.userError("assertion failed", .{});
+                    return self.userErrorKind(.assert, "assertion failed", .{});
                 }
                 return self.eval(a.body, env, pos);
             },
@@ -583,7 +615,9 @@ pub const EvalState = struct {
             } else if (g.inherit_from) |from| {
                 // inherit (x) name → select
                 const sel = try self.alloc.create(ast.Expr);
-                sel.* = .{ .select = .{ .base = from, .attrs = &.{.{ .static = g.name }}, .default = null } };
+                const sel_attrs = try self.alloc.alloc(ast.AttrElem, 1);
+                sel_attrs[0] = .{ .static = g.name };
+                sel.* = .{ .select = .{ .base = from, .attrs = sel_attrs, .default = null } };
                 items[i].value.* = try self.mkThunk(sel, env, pos);
             } else {
                 items[i].value.* = try self.mkThunk(g.value_expr.?, item_env, pos);
@@ -671,7 +705,7 @@ pub const EvalState = struct {
                     else => return self.userError("cannot add {s} to a float", .{showType(v)}),
                 },
                 else => {
-                    const s = try self.coerceToString(&v, &ctx, false, "while evaluating a path segment");
+                    const s = try self.coerceToString(&v, &ctx, false, false, "while evaluating a path segment");
                     try out.appendSlice(s);
                 },
             }
@@ -689,14 +723,12 @@ pub const EvalState = struct {
         }
     }
 
-    /// Nix `coerceToString`.
-    pub fn coerceToString(self: *EvalState, v: *Value, ctx: *std.array_list.Managed(value.CtxElem), copy_to_store: bool, err_ctx: []const u8) EvalError![]const u8 {
+    /// Nix `coerceToString`.  With `coerce_more=false` (string interpolation,
+    /// `+` on strings) only strings and paths are accepted; `toString` and
+    /// derivation attributes use `coerce_more=true`.
+    pub fn coerceToString(self: *EvalState, v: *Value, ctx: *std.array_list.Managed(value.CtxElem), copy_to_store: bool, coerce_more: bool, err_ctx: []const u8) EvalError![]const u8 {
         try self.force(v);
         switch (v.*) {
-            .int => |i| return std.fmt.allocPrint(self.alloc, "{d}", .{i}),
-            .float => |f| return std.fmt.allocPrint(self.alloc, "{d:.6}", .{f}),
-            .bool_ => |b| return if (b) "1" else "",
-            .null_ => return "",
             .string => |s| {
                 try ctx.appendSlice(s.ctx);
                 return s.s;
@@ -710,32 +742,49 @@ pub const EvalState = struct {
                 try ctx.appendSlice(p.ctx);
                 return p.p;
             },
-            .list => |l| {
-                var out = std.array_list.Managed(u8).init(self.alloc);
-                for (l, 0..) |elem, i| {
-                    if (i > 0) try out.append(' ');
-                    var e = elem.*;
-                    const s = try self.coerceToString(&e, ctx, copy_to_store, err_ctx);
-                    try out.appendSlice(s);
-                }
-                return self.alloc.dupe(u8, out.items);
-            },
             .attrs => |a| {
                 // derivation-like set: use outPath
                 if (a.find("outPath")) |op| {
                     var ov = op.*;
-                    const s = try self.coerceToString(&ov, ctx, copy_to_store, err_ctx);
-                    return s;
+                    return self.coerceToString(&ov, ctx, copy_to_store, coerce_more, err_ctx);
                 }
                 return self.userError("cannot coerce {s} to a string: {s}", .{ showType(v.*), err_ctx });
             },
-            else => return self.userError("cannot coerce {s} to a string: {s}", .{ showType(v.*), err_ctx }),
+            else => {
+                if (!coerce_more) {
+                    return self.userError("cannot coerce {s} to a string: {s}", .{ showType(v.*), err_ctx });
+                }
+                switch (v.*) {
+                    .int => |i| return std.fmt.allocPrint(self.alloc, "{d}", .{i}),
+                    .float => |f| return std.fmt.allocPrint(self.alloc, "{d:.6}", .{f}),
+                    .bool_ => |b| return if (b) "1" else "",
+                    .null_ => return "",
+                    .list => |l| {
+                        var out = std.array_list.Managed(u8).init(self.alloc);
+                        for (l, 0..) |elem, i| {
+                            if (i > 0) try out.append(' ');
+                            var e = elem.*;
+                            const s = try self.coerceToString(&e, ctx, copy_to_store, coerce_more, err_ctx);
+                            try out.appendSlice(s);
+                        }
+                        return self.alloc.dupe(u8, out.items);
+                    },
+                    else => return self.userError("cannot coerce {s} to a string: {s}", .{ showType(v.*), err_ctx }),
+                }
+            },
         }
     }
 
     pub fn coerceToPlainString(self: *EvalState, v: *Value, err_ctx: []const u8) EvalError![]const u8 {
         var ctx = std.array_list.Managed(value.CtxElem).init(self.alloc);
-        return self.coerceToString(v, &ctx, false, err_ctx);
+        return self.coerceToString(v, &ctx, false, false, err_ctx);
+    }
+
+    /// Loose string coercion (ints/floats/bools/null/lists allowed), used
+    /// where Nix passes coerceMore=true (e.g. genericClosure keys).
+    pub fn coerceToLooseString(self: *EvalState, v: *Value, err_ctx: []const u8) EvalError![]const u8 {
+        var ctx = std.array_list.Managed(value.CtxElem).init(self.alloc);
+        return self.coerceToString(v, &ctx, false, true, err_ctx);
     }
 
     /// Evaluate a value but swallow errors (for `builtins.tryEval`).
@@ -743,6 +792,8 @@ pub const EvalState = struct {
         const saved_err = self.err_msg;
         var vv = v.*;
         self.force(&vv) catch |e| {
+            // keep err_kind so builtins.tryEval can distinguish
+            // assert/throw (caught) from other errors (propagated)
             self.err_msg = saved_err;
             return e;
         };
@@ -836,14 +887,18 @@ pub const EvalState = struct {
         return p;
     }
 
-    /// import: read + parse + evaluate a file.  Paths are copied to the
-    /// store first (like Nix `realisePath` → `importFile`).
+    /// Parse a file and evaluate it in the base environment.
+    pub fn parseFile(self: *EvalState, p: []const u8) EvalError!*ast.Expr {
+        const contents = fsutil.readFileAlloc(self.alloc, p, 1 << 30) catch |e| {
+            return self.userError("cannot read '{s}': {s}", .{ p, @errorName(e) });
+        };
+        return self.parse(contents, p);
+    }
+
+    /// import: read + parse + evaluate a file.
     pub fn importPath(self: *EvalState, p: []const u8) EvalError!Value {
         const resolved = try self.resolveExprPath(p);
-        const contents = fsutil.readFileAlloc(self.alloc, resolved, 1 << 30) catch |e| {
-            return self.userError("cannot read '{s}': {s}", .{ resolved, @errorName(e) });
-        };
-        const parsed = try self.parse(contents, resolved);
+        const parsed = try self.parseFile(resolved);
         const prev_file = self.cur_file;
         self.cur_file = resolved;
         defer self.cur_file = prev_file;

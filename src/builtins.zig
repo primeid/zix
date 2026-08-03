@@ -74,7 +74,7 @@ fn forceAttrs(st: *Eval, v: *Value, what: []const u8) EvalError!*value.Attrs {
 }
 
 fn forceStringWithCtx(st: *Eval, v: *Value, ctx: *std.array_list.Managed(value.CtxElem), copy: bool, what: []const u8) EvalError![]const u8 {
-    return st.coerceToString(v, ctx, copy, what);
+    return st.coerceToString(v, ctx, copy, false, what);
 }
 
 fn ctxStrings(st: *Eval, ctx: []const value.CtxElem) ![]const []const u8 {
@@ -92,10 +92,15 @@ pub fn makeBuiltins(st: *Eval) !Init {
 
     const B = struct {
         fn add(list: *std.array_list.Managed(value.Item), st2: *Eval, name: []const u8, arity: usize, f: anytype) !void {
-            const b = try st2.alloc.create(value.Builtin);
-            b.* = .{ .name = name, .arity = arity, .f = f };
             const v = try st2.alloc.create(Value);
-            v.* = .{ .builtin = b.* };
+            if (arity == 0) {
+                // constant builtins (langVersion, storeDir, ...) evaluate eagerly
+                v.* = try f(st2, &.{}, 0);
+            } else {
+                const b = try st2.alloc.create(value.Builtin);
+                b.* = .{ .name = name, .arity = arity, .f = f };
+                v.* = .{ .builtin = b.* };
+            }
             try list.append(.{ .name = name, .value = v });
         }
     };
@@ -306,7 +311,7 @@ fn primThrow(st: *Eval, args: []const *Value, pos: usize) EvalError!Value {
     _ = pos;
 
     const msg = try forceStringNoCtx(st, args[0], "while evaluating the argument to builtins.throw");
-    return st.userError("throw: {s}", .{msg});
+    return st.userErrorKind(.thrown, "throw: {s}", .{msg});
 }
 
 fn primTrace(st: *Eval, args: []const *Value, pos: usize) EvalError!Value {
@@ -460,7 +465,7 @@ fn primToString(st: *Eval, args: []const *Value, pos: usize) EvalError!Value {
 
     var v = args[0].*;
     var ctx = std.array_list.Managed(value.CtxElem).init(st.alloc);
-    const s = try st.coerceToString(&v, &ctx, false, "while evaluating the argument to builtins.toString");
+    const s = try st.coerceToString(&v, &ctx, false, true, "while evaluating the argument to builtins.toString");
     return st.mkString(s, ctx.items);
 }
 
@@ -696,9 +701,8 @@ const SortCtx = struct {
     fun: Value,
 
     fn lt(ctx: SortCtx, a: *Value, b: *Value) bool {
-        const pair = ctx.st.alloc.create(Value) catch return false;
-        pair.* = .{ .list = &.{ a, b } };
-        var r = ctx.st.apply(ctx.fun, pair, 0) catch return false;
+        var r = ctx.st.apply(ctx.fun, a, 0) catch return false;
+        r = ctx.st.apply(r, b, 0) catch return false;
         ctx.st.force(&r) catch return false;
         return r == .bool_ and r.bool_;
     }
@@ -899,27 +903,22 @@ fn primZipAttrsWith(st: *Eval, args: []const *Value, pos: usize) EvalError!Value
     var vals = std.array_list.Managed(std.array_list.Managed(*Value)).init(st.alloc);
     for (lists) |l| {
         try st.force(l);
-        if (l.* != .list) return st.userError("'zipAttrsWith': element is not a list", .{});
-        for (l.list) |e| {
-            var ev = e.*;
-            try st.force(&ev);
-            if (ev != .attrs) return st.userError("'zipAttrsWith': element is not a set", .{});
-            for (ev.attrs.items) |it| {
-                var found: ?usize = null;
-                for (keys.items, 0..) |k, i| {
-                    if (std.mem.eql(u8, k, it.name)) {
-                        found = i;
-                        break;
-                    }
+        if (l.* != .attrs) return st.userError("'zipAttrsWith': expected a list of sets", .{});
+        for (l.attrs.items) |it| {
+            var found: ?usize = null;
+            for (keys.items, 0..) |k, i| {
+                if (std.mem.eql(u8, k, it.name)) {
+                    found = i;
+                    break;
                 }
-                if (found) |gi| {
-                    try vals.items[gi].append(it.value);
-                } else {
-                    try keys.append(it.name);
-                    var g = std.array_list.Managed(*Value).init(st.alloc);
-                    try g.append(it.value);
-                    try vals.append(g);
-                }
+            }
+            if (found) |gi| {
+                try vals.items[gi].append(it.value);
+            } else {
+                try keys.append(it.name);
+                var g = std.array_list.Managed(*Value).init(st.alloc);
+                try g.append(it.value);
+                try vals.append(g);
             }
         }
     }
@@ -927,9 +926,11 @@ fn primZipAttrsWith(st: *Eval, args: []const *Value, pos: usize) EvalError!Value
     for (keys.items, 0..) |k, i| {
         const v = try st.alloc.create(Value);
         v.* = .{ .list = vals.items[i].items };
-        items[i] = .{ .name = k, .value = v };
-        const r = try st.apply(fun, v, pos);
-        items[i].value = try st.alloc.create(Value);
+        const name_v = try st.alloc.create(Value);
+        name_v.* = st.mkString(k, &.{});
+        var r = try st.apply(fun, name_v, pos);
+        r = try st.apply(r, v, pos);
+        items[i] = .{ .name = k, .value = try st.alloc.create(Value) };
         items[i].value.* = r;
     }
     return st.mkAttrs(items);
@@ -1055,7 +1056,7 @@ fn primConcatStringsSep(st: *Eval, args: []const *Value, pos: usize) EvalError!V
     for (list, 0..) |e, i| {
         if (i > 0) try out.appendSlice(sep);
         var ev = e.*;
-        const s = try st.coerceToString(&ev, &ctx, false, "while evaluating an element");
+        const s = try st.coerceToString(&ev, &ctx, false, true, "while evaluating an element");
         try out.appendSlice(s);
     }
     return st.mkString(try st.alloc.dupe(u8, out.items), ctx.items);
@@ -1401,7 +1402,7 @@ fn primNixVersion(st: *Eval, args: []const *Value, pos: usize) EvalError!Value {
     _ = args;
     _ = pos;
 
-    return st.mkString("2.34.7-zix", &.{});
+    return st.mkString("2.34.7", &.{});
 }
 
 fn primLangVersion(st: *Eval, args: []const *Value, pos: usize) EvalError!Value {
@@ -1507,15 +1508,20 @@ fn primScopedImport(st: *Eval, args: []const *Value, pos: usize) EvalError!Value
 
 fn primTryEval(st: *Eval, args: []const *Value, pos: usize) EvalError!Value {
     _ = pos;
-
     const success = try st.alloc.create(Value);
     const valv = try st.alloc.create(Value);
     if (st.tryEval(args[0])) |val| {
         success.* = .{ .bool_ = true };
         valv.* = val;
     } else |_| {
-        success.* = .{ .bool_ = false };
-        valv.* = .null_;
+        // Nix only catches assertion failures and `throw`; other errors
+        // propagate. `value = false` is Nix's historical placeholder.
+        if (st.err_kind == .assert or st.err_kind == .thrown) {
+            success.* = .{ .bool_ = false };
+            valv.* = .{ .bool_ = false };
+        } else {
+            return error.UserError;
+        }
     }
     const items = try st.alloc.alloc(value.Item, 2);
     items[0] = .{ .name = "success", .value = success };
@@ -1541,7 +1547,7 @@ fn primGenericClosure(st: *Eval, args: []const *Value, pos: usize) EvalError!Val
         const key_v = cv.attrs.find("key") orelse return st.userError("attribute 'key' missing", .{});
         var kv = key_v.*;
         try st.force(&kv);
-        const key = try st.coerceToPlainString(&kv, "while evaluating the 'key' attribute");
+        const key = try st.coerceToLooseString(&kv, "while evaluating the 'key' attribute");
         if (seen.contains(key)) continue;
         try seen.put(key, {});
         try res.append(cur);
@@ -1655,13 +1661,13 @@ fn derivationStrictInternal(st: *Eval, drv_name: []const u8, attrs: *value.Attrs
             if (v != .list) return st.userError("attribute 'args' is not a list", .{});
             for (v.list) |elem| {
                 var ev = elem.*;
-                const s = try st.coerceToString(&ev, &context, true, "while evaluating an element of the argument list");
+                const s = try st.coerceToString(&ev, &context, true, true, "while evaluating an element of the argument list");
                 try args_list.append(s);
             }
             continue;
         }
         // default: environment variable (coerced with store copying)
-        const s = try st.coerceToString(&v, &context, true, "while evaluating a derivation attribute");
+        const s = try st.coerceToString(&v, &context, true, true, "while evaluating a derivation attribute");
         try env.append(.{ .name = it.name, .value = s });
         if (std.mem.eql(u8, it.name, "builder")) builder = s;
         if (std.mem.eql(u8, it.name, "system")) platform = s;

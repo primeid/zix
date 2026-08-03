@@ -2,6 +2,7 @@
 //! Re-exports the interpreter modules so `zig build test` covers them all.
 
 pub const nixhash = @import("nixhash.zig");
+pub const fsutil = @import("fsutil.zig");
 pub const store = @import("store.zig");
 pub const drv = @import("drv.zig");
 pub const lexer = @import("lexer.zig");

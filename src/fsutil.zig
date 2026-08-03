@@ -99,6 +99,5 @@ pub fn pathExists(path: []const u8) bool {
 }
 
 pub fn homeDir() []const u8 {
-    if (std.posix.getenv("HOME")) |h| return h;
-    return "/home/magnus";
+    return "/";
 }

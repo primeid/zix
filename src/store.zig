@@ -85,7 +85,10 @@ pub const Store = struct {
             if (refs.len > 0) {
                 var parts = std.array_list.Managed([]const u8).init(self.alloc);
                 try parts.append("source");
-                for (refs) |r| try parts.append(r);
+                for (refs) |r| {
+                    try parts.append(":");
+                    try parts.append(r);
+                }
                 typ = try self.cat(parts.items);
             }
             return self.makeStorePath(typ, hash, name);
@@ -93,7 +96,8 @@ pub const Store = struct {
         if (refs.len > 0) return error.FixedOutputWithRefs;
         var hexbuf: [2 * 32]u8 = undefined;
         const hex = nixhash.base16Encode(&hexbuf, hash.bytes[0..hash.hash_size]);
-        const payload = try self.cat(&.{ "fixed:out:", ingestionPrefix(method), hex, ":" });
+        // "fixed:out:" + rec + algo + ":" + hash + ":" (hash with algo prefix)
+        const payload = try self.cat(&.{ "fixed:out:", ingestionPrefix(method), "sha256:", hex, ":" });
         const digest = Hash{ .bytes = sha256(payload), .hash_size = 32 };
         return self.makeOutputPath("out", digest, name);
     }
@@ -102,7 +106,10 @@ pub const Store = struct {
     pub fn makeTextPath(self: *const Store, name: []const u8, hash: Hash, refs: []const []const u8) ![]const u8 {
         var parts = std.array_list.Managed([]const u8).init(self.alloc);
         try parts.append("text");
-        for (refs) |r| try parts.append(r);
+        for (refs) |r| {
+            try parts.append(":");
+            try parts.append(r);
+        }
         const typ = try self.cat(parts.items);
         return self.makeStorePath(typ, hash, name);
     }

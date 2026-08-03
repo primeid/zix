@@ -351,19 +351,37 @@ fn deepForce(st: *Eval, v: *Value) EvalError!void {
 
 fn arith(st: *Eval, args: []const *Value, comptime op: enum { add, sub, mul, div }, pos: usize) EvalError!Value {
     _ = pos;
-
-    const a = try forceInt(st, args[0], "");
-    const b = try forceInt(st, args[1], "");
-    const r = switch (op) {
-        .add => std.math.add(i64, a, b) catch return st.userError("integer overflow in adding {d} + {d}", .{ a, b }),
-        .sub => std.math.sub(i64, a, b) catch return st.userError("integer overflow in subtracting {d} - {d}", .{ a, b }),
-        .mul => std.math.mul(i64, a, b) catch return st.userError("integer overflow in multiplying {d} * {d}", .{ a, b }),
+    var av = args[0].*;
+    var bv = args[1].*;
+    try st.force(&av);
+    try st.force(&bv);
+    const a_int = av == .int;
+    const b_int = bv == .int;
+    if (a_int and b_int) {
+        const a = av.int;
+        const b = bv.int;
+        const r = switch (op) {
+            .add => std.math.add(i64, a, b) catch return st.userError("integer overflow in adding {d} + {d}", .{ a, b }),
+            .sub => std.math.sub(i64, a, b) catch return st.userError("integer overflow in subtracting {d} - {d}", .{ a, b }),
+            .mul => std.math.mul(i64, a, b) catch return st.userError("integer overflow in multiplying {d} * {d}", .{ a, b }),
+            .div => blk: {
+                if (b == 0) return st.userError("division by zero", .{});
+                break :blk std.math.divTrunc(i64, a, b) catch return st.userError("integer overflow in dividing {d} / {d}", .{ a, b });
+            },
+        };
+        return .{ .int = r };
+    }
+    const af: f64 = if (a_int) @floatFromInt(av.int) else if (av == .float) av.float else return st.userError("cannot use {s} in arithmetic", .{eval.EvalState.showType(av)});
+    const bf: f64 = if (b_int) @floatFromInt(bv.int) else if (bv == .float) bv.float else return st.userError("cannot use {s} in arithmetic", .{eval.EvalState.showType(bv)});
+    return .{ .float = switch (op) {
+        .add => af + bf,
+        .sub => af - bf,
+        .mul => af * bf,
         .div => blk: {
-            if (b == 0) return st.userError("division by zero", .{});
-            break :blk std.math.divTrunc(i64, a, b) catch return st.userError("integer overflow in dividing {d} / {d}", .{ a, b });
+            if (bf == 0) return st.userError("division by zero", .{});
+            break :blk af / bf;
         },
-    };
-    return .{ .int = r };
+    } };
 }
 
 fn primAdd(st: *Eval, args: []const *Value, pos: usize) EvalError!Value {
@@ -520,10 +538,8 @@ fn primFoldl(st: *Eval, args: []const *Value, pos: usize) EvalError!Value {
     const acc: *Value = args[1];
     const list = try forceList(st, args[2], "");
     for (list) |elem| {
-        const pair = try st.alloc.create(Value);
-        pair.* = .{ .list = &.{ acc, elem } };
-        var r = try st.apply(fun, pair, pos);
-        _ = &r;
+        var r = try st.apply(fun, acc, pos);
+        r = try st.apply(r, elem, pos);
         acc.* = r;
     }
     return acc.*;
@@ -785,10 +801,9 @@ fn primAttrValues(st: *Eval, args: []const *Value, pos: usize) EvalError!Value {
 
 fn primHasAttr(st: *Eval, args: []const *Value, pos: usize) EvalError!Value {
     _ = pos;
-
-    var a = args[0].*;
+    const name = try forceStringNoCtx(st, args[0], "while evaluating the first argument to builtins.hasAttr");
+    var a = args[1].*;
     try st.force(&a);
-    const name = try forceStringNoCtx(st, args[1], "while evaluating the second argument to builtins.hasAttr");
     if (a != .attrs) return st.userError("'hasAttr' called on {s}, expected a set", .{eval.EvalState.showType(a)});
     return .{ .bool_ = a.attrs.find(name) != null };
 }

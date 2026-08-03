@@ -262,11 +262,19 @@ pub const EvalState = struct {
                 },
                 .and_, .or_, .impl => {
                     const l = try self.evalBool(op.left, env, pos, "in the left operand of the AND (&&) operator");
-                    const r = try self.evalBool(op.right, env, pos, "in the right operand of the AND (&&) operator");
                     const b: bool = switch (op.kind) {
-                        .and_ => l and r,
-                        .or_ => l or r,
-                        .impl => (!l) or r,
+                        .and_ => blk: {
+                            if (!l) break :blk false;
+                            break :blk try self.evalBool(op.right, env, pos, "in the right operand of the AND (&&) operator");
+                        },
+                        .or_ => blk: {
+                            if (l) break :blk true;
+                            break :blk try self.evalBool(op.right, env, pos, "in the right operand of the OR (||) operator");
+                        },
+                        .impl => blk: {
+                            if (!l) break :blk true;
+                            break :blk try self.evalBool(op.right, env, pos, "in the right operand of the IMPL (->) operator");
+                        },
                         else => unreachable,
                     };
                     return .{ .bool_ = b };

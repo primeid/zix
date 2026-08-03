@@ -168,8 +168,8 @@ fn printValueSeen(
     }
     try st.force(v);
     switch (v.*) {
-        .int => |i| try w.appendSlice(try std.fmt.allocPrint(std.heap.page_allocator, "{d}", .{i})),
-        .float => |f| try w.appendSlice(try std.fmt.allocPrint(std.heap.page_allocator, "{d}", .{f})),
+        .int => |i| try w.appendSlice(try std.fmt.allocPrint(st.alloc, "{d}", .{i})),
+        .float => |f| try w.appendSlice(try std.fmt.allocPrint(st.alloc, "{d}", .{f})),
         .bool_ => |b| try w.appendSlice(if (b) "true" else "false"),
         .null_ => try w.appendSlice("null"),
         .string => |s| {
@@ -195,7 +195,7 @@ fn printValueSeen(
             if (raw) {
                 try w.appendSlice(p.p);
             } else {
-                try w.appendSlice(try std.fmt.allocPrint(std.heap.page_allocator, "\"{s}\"", .{p.p}));
+                try w.appendSlice(try std.fmt.allocPrint(st.alloc, "\"{s}\"", .{p.p}));
             }
         },
         .list => |l| {
@@ -214,12 +214,12 @@ fn printValueSeen(
                 }
             }
             try w.appendSlice("{ ");
-            const new_seen = try std.heap.page_allocator.alloc(*const value.Attrs, seen.len + 1);
+            const new_seen = try st.alloc.alloc(*const value.Attrs, seen.len + 1);
             @memcpy(new_seen[0..seen.len], seen);
             new_seen[seen.len] = a;
             for (a.items, 0..) |it, i| {
                 if (i > 0) try w.appendSlice("; ");
-                try w.appendSlice(try std.fmt.allocPrint(std.heap.page_allocator, "{s} = ", .{it.name}));
+                try w.appendSlice(try std.fmt.allocPrint(st.alloc, "{s} = ", .{it.name}));
                 try printValueSeen(st, it.value, w, depth + 1, raw, new_seen);
             }
             try w.appendSlice("; }");

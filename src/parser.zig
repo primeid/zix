@@ -32,13 +32,13 @@ pub const Parser = struct {
     }
 
     fn peek(self: *Parser) Token {
-        if (self.i >= self.toks.len) return self.toks[self.toks.len - 1];
+        if (self.i >= self.toks.len) return .{ .kind = .eof, .text = "", .line = 0, .col = 0 };
         return self.toks[self.i];
     }
 
     fn peekAt(self: *Parser, off: usize) Token {
         const j = self.i + off;
-        if (j >= self.toks.len) return self.toks[self.toks.len - 1];
+        if (j >= self.toks.len) return .{ .kind = .eof, .text = "", .line = 0, .col = 0 };
         return self.toks[j];
     }
 

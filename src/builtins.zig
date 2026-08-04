@@ -139,6 +139,9 @@ pub fn makeBuiltins(st: *Eval) !Init {
     try B.add(&items, st, "fromJSON", 1, primFromJSON);
     try B.add(&items, st, "fromTOML", 1, primFromTOML);
     try B.add(&items, st, "map", 2, primMap);
+    try B.add(&items, st, "mapAttrs", 2, primMapAttrs);
+    try B.add(&items, st, "mapAttrs'", 2, primMapAttrsPrime);
+    try B.add(&items, st, "toPath", 1, primToPath);
     try B.add(&items, st, "filter", 2, primFilter);
     try B.add(&items, st, "foldl'", 3, primFoldl);
     try B.add(&items, st, "genList", 2, primGenList);
@@ -518,6 +521,49 @@ fn primTypeOf(st: *Eval, args: []const *Value, pos: usize) EvalError!Value {
 // ---------------------------------------------------------------------------
 // List builtins
 // ---------------------------------------------------------------------------
+
+fn primMapAttrs(st: *Eval, args: []const *Value, pos: usize) EvalError!Value {
+    const fun = args[0].*;
+    const a = try forceAttrs(st, args[1], "while evaluating the second argument to builtins.mapAttrs");
+    const items = try st.alloc.alloc(value.Item, a.items.len);
+    for (a.items, 0..) |it, i| {
+        const name_v = try st.alloc.create(Value);
+        name_v.* = st.mkString(it.name, &.{});
+        // Lazy value thunks (like Nix): the application is forced on access.
+        const v = try st.alloc.create(Value);
+        v.* = try st.mkLazyApply(fun, &.{ name_v, it.value }, pos);
+        items[i] = .{ .name = it.name, .value = v };
+    }
+    return st.mkAttrs(items);
+}
+
+fn primMapAttrsPrime(st: *Eval, args: []const *Value, pos: usize) EvalError!Value {
+    _ = pos;
+    const fun = args[0].*;
+    const a = try forceAttrs(st, args[1], "while evaluating the second argument to builtins.mapAttrs'");
+    const items = try st.alloc.alloc(value.Item, a.items.len);
+    for (a.items, 0..) |it, i| {
+        const name_v = try st.alloc.create(Value);
+        name_v.* = st.mkString(it.name, &.{});
+        var r = try st.apply(fun, name_v, 0);
+        r = try st.apply(r, it.value, 0);
+        var rv = r;
+        try st.force(&rv);
+        if (rv != .attrs) return st.userError("builtins.mapAttrs' expected a {{ name, value }} pair", .{});
+        const nv = rv.attrs.find("name") orelse return st.userError("builtins.mapAttrs' result missing 'name'", .{});
+        var nv2 = nv.*;
+        const new_name = try forceStringNoCtx(st, &nv2, "while evaluating the 'name' of a mapAttrs' result");
+        const vv = rv.attrs.find("value") orelse return st.userError("builtins.mapAttrs' result missing 'value'", .{});
+        items[i] = .{ .name = new_name, .value = vv };
+    }
+    return st.mkAttrs(items);
+}
+
+fn primToPath(st: *Eval, args: []const *Value, pos: usize) EvalError!Value {
+    _ = pos;
+    const s = try forceStringNoCtx(st, args[0], "while evaluating the argument to builtins.toPath");
+    return .{ .path = .{ .p = s } };
+}
 
 fn primMap(st: *Eval, args: []const *Value, pos: usize) EvalError!Value {
 
@@ -2961,8 +3007,10 @@ fn regexSplit(st: *Eval, pat: []const u8, s: []const u8) EvalError!Value {
             mv.* = .{ .list = caps };
             try out.append(mv);
         } else {
+            // No explicit capture groups: Nix yields an empty list for the
+            // separator position (captured groups would appear here).
             const mv = try st.alloc.create(Value);
-            mv.* = st.mkString(s[mstart.?..mend], &.{});
+            mv.* = .{ .list = &.{} };
             try out.append(mv);
         }
         pos = mend;

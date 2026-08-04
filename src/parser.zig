@@ -72,6 +72,12 @@ pub const Parser = struct {
         return e;
     }
 
+    /// Line/column of the current token, for error reporting.
+    pub fn curPos(self: *Parser) struct { line: usize, col: usize } {
+        const t = self.peek();
+        return .{ .line = t.line, .col = t.col };
+    }
+
     fn allocExpr(self: *Parser, e: ast.Kind) ParseError!*ast.Expr {
         const p = try self.alloc.create(ast.Expr);
         const t = self.peek();
@@ -732,6 +738,7 @@ pub const Parser = struct {
                 ellipsis = true;
                 break;
             }
+            if (t.kind == .rbrace) break; // trailing comma `{ a, b, }`
             if (t.kind != .ident) return error.ExpectedToken;
             _ = self.advance();
             var default: ?*ast.Expr = null;

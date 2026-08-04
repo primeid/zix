@@ -765,28 +765,25 @@ pub const Lexer = struct {
     /// Lex tokens for a `${...}` interpolation, stopping after the
     /// matching `}` (which is consumed).  Returns the token slice.
     fn lexInterpolation(self: *Lexer) LexError![]const Token {
+        // The interpolation content is a full expression; braces are counted
+        // from the token stream so that whitespace or operators around a
+        // closing `}` are handled correctly (e.g. multi-line `${ expr }`).
         var toks = std.array_list.Managed(Token).init(self.alloc);
         var depth: usize = 1;
         while (depth > 0) {
-            const c = self.peek(0) orelse return error.UnterminatedInterpolation;
-            if (c == '{') {
-                depth += 1;
-                _ = self.advance();
-                const t = self.pushToken(.lbrace, "");
-                try toks.append(t);
-                continue;
-            }
-            if (c == '}') {
-                depth -= 1;
-                _ = self.advance();
-                if (depth == 0) break;
-                const t = self.pushToken(.rbrace, "");
-                try toks.append(t);
-                continue;
-            }
             const t = try self.nextToken();
-            if (t.kind == .eof) return error.UnterminatedInterpolation;
-            try toks.append(t);
+            switch (t.kind) {
+                .eof => return error.UnterminatedInterpolation,
+                .lbrace => {
+                    depth += 1;
+                    try toks.append(t);
+                },
+                .rbrace => {
+                    depth -= 1;
+                    if (depth > 0) try toks.append(t);
+                },
+                else => try toks.append(t),
+            }
         }
         return toks.items;
     }

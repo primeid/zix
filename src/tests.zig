@@ -193,6 +193,26 @@ test "eval: store paths match real Nix 2.34.7" {
     );
 }
 
+test "eval: nixpkgs-compat regressions" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // trailing comma in formals
+    try expectEval(a, "({ a, b, }: a + b) { a = 1; b = 2; }", "3");
+    // @args visible in formals defaults (nixpkgs impure.nix pattern)
+    try expectEval(a, "let f = { a ? b, ... }@b: b; in (f { x = 1; }).x", "1");
+    // lazy mapAttrs (self-referential attrset must not cycle)
+    try expectEval(a, "let final = { parsed = { abi = { assertions = [ ]; }; }; } // builtins.mapAttrs (n: v: v final.parsed) { isAndroid = x: x.isAndroid or false; }; in final.isAndroid", "false");
+    // lazy map elements
+    try expectEval(a, "let f = { a = 1; }; in builtins.map (x: x.a) [f]", "[ 1 ]");
+    // builtins.split: separators become empty capture lists
+    try expectEval(a, "builtins.split \"-\" \"x86_64-linux\"", "[ x86_64 [  ] linux ]");
+    // builtins.mapAttrs
+    try expectEval(a, "builtins.mapAttrs (n: v: v * 2) { a = 1; b = 2; }", "{ a = 2; b = 4; }");
+    // builtins.mapAttrs'
+    try expectEval(a, "builtins.mapAttrs' (n: v: { name = n + \"x\"; value = v; }) { a = 1; }", "{ ax = 1; }");
+}
+
 test "eval: positions (__curPos, unsafeGetAttrPos)" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

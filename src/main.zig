@@ -89,7 +89,11 @@ pub fn main(init: std.process.Init) !void {
     if (mode == .parse) {
         const contents = readFileOrExit(a, target_str);
         _ = st.parse(contents, target_str) catch |e| {
-            std.debug.print("zix: parse error: {s}\n", .{@errorName(e)});
+            if (st.err_msg.len > 0) {
+                std.debug.print("zix: parse error: {s}\n", .{st.err_msg});
+            } else {
+                std.debug.print("zix: parse error: {s}\n", .{@errorName(e)});
+            }
             std.process.exit(1);
         };
         return;
@@ -113,6 +117,7 @@ pub fn main(init: std.process.Init) !void {
                     if (ctx.st.cur_pos.line > 0) {
                         std.debug.print("       at «{s}»:{d}:{d}\n", .{ ctx.st.cur_pos.file, ctx.st.cur_pos.line, ctx.st.cur_pos.col });
                     }
+                    printTrace(ctx.st);
                 } else {
                     std.debug.print("zix: error printing value: {s}\n", .{@errorName(e)});
                 }
@@ -197,12 +202,29 @@ fn resolveDrvPath(st: *eval.EvalState, target: []const u8) ![]const u8 {
     return dv.string.s;
 }
 
+fn printTrace(st: *eval.EvalState) void {
+    for (st.err_trace.items) |tp| std.debug.print("  «{s}»:{d}:{d}\n", .{ tp.file, tp.line, tp.col });
+    var seen = std.StringHashMap(void).init(st.alloc);
+    var i = st.err_trace.items.len;
+    while (i > 0) {
+        i -= 1;
+        const p = st.err_trace.items[i];
+        if (p.line == 0) continue;
+        if (p.line == st.cur_pos.line and p.col == st.cur_pos.col and std.mem.eql(u8, p.file, st.cur_pos.file)) continue;
+        const key = std.fmt.allocPrint(st.alloc, "{s}:{d}:{d}", .{ p.file, p.line, p.col }) catch continue;
+        if (seen.contains(key)) continue;
+        seen.put(key, {}) catch {};
+        std.debug.print("       while evaluating at «{s}»:{d}:{d}\n", .{ p.file, p.line, p.col });
+    }
+}
+
 fn exitEvalError(e: anyerror, st: *eval.EvalState) noreturn {
     if (st.err_msg.len > 0) {
         std.debug.print("zix: error: {s}\n", .{st.err_msg});
         if (st.cur_pos.line > 0) {
             std.debug.print("       at «{s}»:{d}:{d}\n", .{ st.cur_pos.file, st.cur_pos.line, st.cur_pos.col });
         }
+        printTrace(st);
     } else {
         std.debug.print("zix: error: {s}\n", .{@errorName(e)});
     }

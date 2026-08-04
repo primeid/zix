@@ -53,6 +53,12 @@ pub const EvalState = struct {
     call_depth: usize = 0,
     /// position of the expression currently being evaluated (for errors)
     cur_pos: ast.Pos = .{},
+    /// set when an error is in flight so the trace is kept during unwinding
+    err_active: bool = false,
+    /// current evaluation chain (innermost last) for cycle diagnostics
+    eval_chain: std.array_list.Managed(ast.Pos) = undefined,
+    /// error trace: innermost positions first (for Nix-style traces)
+    err_trace: std.array_list.Managed(ast.Pos) = undefined,
     /// current file being evaluated (for __curPos / import paths)
     cur_file: []const u8 = "",
     /// import cache: path → parsed expr
@@ -75,6 +81,8 @@ pub const EvalState = struct {
             .base_env = undefined,
             .import_cache = std.StringHashMap(*ast.Expr).init(alloc),
             .src_to_store = std.StringHashMap([]const u8).init(alloc),
+            .err_trace = std.array_list.Managed(ast.Pos).init(alloc),
+            .eval_chain = std.array_list.Managed(ast.Pos).init(alloc),
         };
         // builtins + base env (mutually recursive construction)
         const b = try builtins.makeBuiltins(st);
@@ -91,12 +99,14 @@ pub const EvalState = struct {
     pub fn userError(self: *EvalState, comptime fmt: []const u8, args: anytype) EvalError {
         self.err_msg = std.fmt.allocPrint(self.alloc, fmt, args) catch return error.OutOfMemory;
         self.err_kind = .other;
+        self.err_active = true;
         return error.UserError;
     }
 
     pub fn userErrorKind(self: *EvalState, kind: @TypeOf(self.err_kind), comptime fmt: []const u8, args: anytype) EvalError {
         self.err_msg = std.fmt.allocPrint(self.alloc, fmt, args) catch return error.OutOfMemory;
         self.err_kind = kind;
+        self.err_active = true;
         return error.UserError;
     }
 
@@ -108,6 +118,30 @@ pub const EvalState = struct {
         const t = try self.alloc.create(value.Thunk);
         t.* = .{ .expr = expr, .env = env, .pos = pos };
         return .{ .thunk = t };
+    }
+
+    /// A lazy application: `fun arg0 arg1 ...` evaluated only when forced.
+    /// Used by `map`/`mapAttrs` so element values stay lazy like Nix.
+    pub fn mkLazyApply(self: *EvalState, fun: Value, args: []const *Value, pos: usize) EvalError!Value {
+        const fun_copy = try self.alloc.create(Value);
+        fun_copy.* = fun;
+        const vars = try self.alloc.alloc(value.Var, 1 + args.len);
+        vars[0] = .{ .name = "__zix_f", .value = fun_copy };
+        for (args, 0..) |a, i| {
+            vars[i + 1] = .{ .name = try std.fmt.allocPrint(self.alloc, "__zix_a{d}", .{i}), .value = a };
+        }
+        const env = try self.alloc.create(Env);
+        env.* = .{ .parent = self.base_env, .vars = vars };
+        var expr: *ast.Expr = try self.alloc.create(ast.Expr);
+        expr.* = .{ .pos = .{}, .kind = .{ .var_ref = "__zix_f" } };
+        for (args, 0..) |_, i| {
+            const arg_ref = try self.alloc.create(ast.Expr);
+            arg_ref.* = .{ .pos = .{}, .kind = .{ .var_ref = try std.fmt.allocPrint(self.alloc, "__zix_a{d}", .{i}) } };
+            const app = try self.alloc.create(ast.Expr);
+            app.* = .{ .pos = .{}, .kind = .{ .apply = .{ .fun = expr, .arg = arg_ref } } };
+            expr = app;
+        }
+        return self.mkThunk(expr, env, pos);
     }
 
     pub fn mkString(self: *EvalState, s: []const u8, ctx: []const value.CtxElem) Value {
@@ -133,7 +167,14 @@ pub const EvalState = struct {
             switch (v.*) {
                 .thunk => |t| {
                     switch (t.state) {
-                        .evaluating => return error.InfiniteRecursion,
+                        .evaluating => {
+                            if (self.eval_chain.items.len > 0) {
+                                for (self.eval_chain.items) |cp| {
+                                    std.debug.print("  «{s}»:{d}:{d}\n", .{ cp.file, cp.line, cp.col });
+                                }
+                            }
+                            return error.InfiniteRecursion;
+                        },
                         .done => {
                             v.* = t.value;
                         },
@@ -190,6 +231,20 @@ pub const EvalState = struct {
             return self.userError("stack overflow (possible infinite recursion)", .{});
         }
         self.cur_pos = expr.pos;
+        self.eval_chain.append(expr.pos) catch {};
+        defer {
+            if (!self.err_active and self.eval_chain.items.len > 0) _ = self.eval_chain.pop();
+        }
+        // Capture the position in the error trace: on error we unwind and
+        // the innermost position is printed first.  Only record leaf-ish
+        // nodes to keep the trace readable.
+        const trace_depth = if (self.err_trace.items.len > 0) self.err_trace.items.len else 0;
+        self.err_trace.append(expr.pos) catch {};
+        defer {
+            if (!self.err_active and self.err_trace.items.len > trace_depth) {
+                _ = self.err_trace.pop();
+            }
+        }
         switch (expr.kind) {
             .int => |i| return .{ .int = i },
             .float => |f| return .{ .float = f },
@@ -247,7 +302,7 @@ pub const EvalState = struct {
                         },
                     };
                     if (cur.* != .attrs) {
-                        return self.userError("attribute '{s}' missing", .{name});
+                                        return self.userError("attribute '{s}' missing", .{name});
                     }
                     const item = cur.attrs.find(name) orelse {
                         if (sel.default) |d| {
@@ -468,7 +523,14 @@ pub const EvalState = struct {
                 return .{ .builtin = nb.* };
             },
             .lambda => |lam| return self.callLambda(lam, arg, pos),
-            else => return self.userError("attempt to call something which is not a function but {s}", .{showType(f)}),
+            else => {
+                var names_buf = std.array_list.Managed(u8).init(self.alloc);
+                for (f.attrs.items) |it| {
+                    names_buf.appendSlice(it.name) catch {};
+                    names_buf.append(' ') catch {};
+                }
+                return self.userError("attempt to call something which is not a function but {s}", .{showType(f)});
+            },
         }
     }
 
@@ -495,12 +557,16 @@ pub const EvalState = struct {
         if (params.arg_name) |name| {
             try vars.append(.{ .name = name, .value = av });
         }
+        // Defaults can reference `@args` and previously-bound formals, so they
+        // are evaluated in an env snapshot of what has been bound so far.
         for (formals.formals) |formal| {
             const slot = try self.alloc.create(Value);
             if (arg_attrs.find(formal.name)) |item| {
                 slot.* = item.*;
             } else if (formal.default) |d| {
-                slot.* = try self.mkThunk(d, lam.env, pos);
+                const cur_env = try self.alloc.create(Env);
+                cur_env.* = .{ .parent = lam.env, .vars = vars.items };
+                slot.* = try self.mkThunk(d, cur_env, pos);
             } else {
                 return self.userError("function 'anonymous lambda' called without required argument '{s}'", .{formal.name});
             }
@@ -626,7 +692,9 @@ pub const EvalState = struct {
                 const sel_attrs = try self.alloc.alloc(ast.AttrElem, 1);
                 sel_attrs[0] = .{ .static = g.name };
                 sel.* = .{ .pos = g.pos, .kind = .{ .select = .{ .base = from, .attrs = sel_attrs, .default = null } } };
-                items[i].value.* = try self.mkThunk(sel, env, pos);
+                // The inherit-from expression must see the recursive bindings
+                // (e.g. `inherit (lib) ...` inside a `let lib = ...; in ...`).
+                items[i].value.* = try self.mkThunk(sel, item_env, pos);
             } else {
                 items[i].value.* = try self.mkThunk(g.value_expr.?, item_env, pos);
             }
@@ -884,7 +952,8 @@ pub const EvalState = struct {
                 return joined;
             }
         }
-        return self.userError("cannot find '{s}' in the search path", .{name});
+        // Nix raises ThrownError here, so `builtins.tryEval` catches it.
+        return self.userErrorKind(.thrown, "cannot find '{s}' in the search path", .{name});
     }
 
     /// Resolve a path value for reading/import: directories get default.nix.
@@ -923,7 +992,8 @@ pub const EvalState = struct {
         var p = parser.Parser.init(self.alloc, toks, base_dir, self.home_dir);
         p.file = file;
         return p.parse() catch |e| {
-            return self.userError("parse error in '{s}': {s}", .{ file, @errorName(e) });
+            const pos = p.curPos();
+            return self.userError("parse error in '{s}': {s} at «{s}»:{d}:{d}", .{ file, @errorName(e), file, pos.line, pos.col });
         };
     }
 

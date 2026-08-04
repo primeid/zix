@@ -164,3 +164,12 @@ Phase 0 ──► Phase 1 (realisation) ──► Phase 3 (nixpkgs) ──► Ph
 2. **Binary-cache substitution** (`cache.nixos.org`): post-1.0, or essential?
 3. **Sandbox bootstrap**: use host tools (`/bin/sh` etc.) unsandboxed first, or invest in a bundled mini-bootstrap for chroot from the start? Recommendation: unsandboxed first, sandbox after (matches the milestone order above).
 4. **Store DB**: JSON index (recommended) vs sqlite.
+
+## Open decisions — resolved
+
+| Decision | Resolution | Status |
+|---|---|---|
+| Flakes / `getFlake` in v1 | **Out of scope for v1.** ZIX targets the language core, derivations and the store. Flake support (flake.nix, locks, registries) is a large surface orthogonal to the evaluator and will land after 1.0 behind the `flakes` experimental feature, mirroring Nix. | Documented |
+| Binary-cache substitution | **After 1.0.** `zix build` realizes derivations locally; downloading prebuilt store paths (narinfo + NAR-over-HTTP) reuses the same NAR codec already implemented and is a natural follow-up. | Documented |
+| Sandbox bootstrapping | **Unsandboxed first, sandbox opt-in.** `zix build` runs builders unsandboxed by default; `--sandbox` enables a bubblewrap sandbox (`--unshare-all`, read-only root, tmpfs /tmp//run//dev, scrubbed env). Verified: network blocked, writes outside the store fail. | **Implemented** |
+| Store database | **JSON index** (`zix-db.json` in the store dir) — human-readable, trivially diffable, no external dependencies. Loaded at startup, rewritten on registration. `zix gc` computes the live set from the DB + .drv files. | **Implemented** |

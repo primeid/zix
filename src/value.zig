@@ -47,6 +47,8 @@ pub const Thunk = struct {
     state: enum { unevaluated, evaluating, done } = .unevaluated,
     value: Value = .null_,
     pos: usize = 0,
+    /// A pending builtin application (Nix applies builtins lazily).
+    builtin: ?Builtin = null,
 };
 
 pub const Value = union(enum) {

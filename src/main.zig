@@ -27,7 +27,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     var target: ?[]const u8 = null;
-    var mode: enum { eval, parse, build } = .eval;
+    var mode: enum { eval, parse, build, gc } = .eval;
     var expr_mode = false;
     var raw = false;
     var json = false;
@@ -67,6 +67,8 @@ pub fn main(init: std.process.Init) !void {
             json = true;
         } else if (std.mem.eql(u8, arg, "--sandbox") or std.mem.eql(u8, arg, "--no-sandbox")) {
             sandbox = std.mem.eql(u8, arg, "--sandbox");
+        } else if (std.mem.eql(u8, arg, "--delete") and mode == .gc) {
+            // handled by the gc section (needs to be seen before mode dispatch)
         } else if (std.mem.eql(u8, arg, "-A")) {
             i += 1;
             if (i >= argv.items.len) {
@@ -87,6 +89,8 @@ pub fn main(init: std.process.Init) !void {
             mode = .parse;
         } else if (std.mem.eql(u8, arg, "build")) {
             mode = .build;
+        } else if (std.mem.eql(u8, arg, "gc")) {
+            mode = .gc;
         } else if (std.mem.eql(u8, arg, "eval")) {
             mode = .eval;
         } else if (target == null and expr_mode) {
@@ -104,6 +108,54 @@ pub fn main(init: std.process.Init) !void {
     defer st.deinit();
     st.environ = init.environ_map;
     st.nix_path = try parseNixPath(a, init.environ_map, nix_path_extra.items);
+
+    if (mode == .gc) {
+        var dry_run = true;
+        for (argv.items[1..]) |arg| {
+            if (std.mem.eql(u8, arg, "--delete")) dry_run = false;
+        }
+        var live = std.StringHashMap(void).init(a);
+        var it = st.store.db.iterator();
+        while (it.next()) |e| {
+            try live.put(e.key_ptr.*, {});
+            for (e.value_ptr.refs) |r| try live.put(r, {});
+        }
+        var dir = std.Io.Dir.cwd().openDir(zix.fsutil.io, st.store.store_dir, .{ .iterate = true }) catch {
+            std.debug.print("zix: cannot open store directory\n", .{});
+            std.process.exit(1);
+        };
+        defer dir.close(zix.fsutil.io);
+        var dit = dir.iterate();
+        while (dit.next(zix.fsutil.io) catch null) |entry| {
+            if (entry.kind != .file) continue;
+            if (!std.mem.endsWith(u8, entry.name, ".drv")) continue;
+            const full = try std.fs.path.join(a, &.{ st.store.store_dir, entry.name });
+            const contents = zix.fsutil.readFileAlloc(a, full, 1 << 30) catch continue;
+            const drv = zix.drv.parseDerivation(a, contents) catch continue;
+            try live.put(full, {});
+            for (drv.input_srcs) |s2| try live.put(s2, {});
+            for (drv.input_drvs) |id| try live.put(id.path, {});
+            for (drv.outputs) |o| if (o.path.len > 0) try live.put(o.path, {});
+        }
+        var freed: usize = 0;
+        var dit2 = dir.iterate();
+        while (dit2.next(zix.fsutil.io) catch null) |entry| {
+            if (entry.kind != .file) continue;
+            if (std.mem.endsWith(u8, entry.name, ".drv")) continue;
+            if (std.mem.eql(u8, entry.name, "zix-db.json") or std.mem.endsWith(u8, entry.name, ".tmp")) continue;
+            const full = try std.fs.path.join(a, &.{ st.store.store_dir, entry.name });
+            if (live.contains(full)) continue;
+            if (dry_run) {
+                std.debug.print("would delete: {s}\n", .{full});
+            } else {
+                dir.deleteFile(zix.fsutil.io, entry.name) catch continue;
+            }
+            freed += 1;
+        }
+        std.debug.print("zix: gc: {d} objects {s}\n", .{ freed, if (dry_run) "would delete" else "deleted" });
+        return;
+    }
+
 
     const target_str = target orelse {
         std.debug.print("zix: missing file or expression argument\n", .{});

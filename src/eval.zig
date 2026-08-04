@@ -176,6 +176,15 @@ pub const EvalState = struct {
         while (true) {
             switch (v.*) {
                 .thunk => |t| {
+                    if (t.builtin) |b| {
+                        // Lazy builtin application: run it on first force.
+                        v.* = b.f(self, b.args, t.pos) catch |e| {
+                            return e;
+                        };
+                        continue;
+                    }
+
+
                     switch (t.state) {
                         .evaluating => {
                             if (self.eval_chain.items.len > 2) {
@@ -314,8 +323,6 @@ pub const EvalState = struct {
                         },
                     };
                     if (cur.* != .attrs) {
-                        // Nix's `expr.attr or default` returns the default for
-                        // non-attrset bases too (e.g. `null.a or "d"` == "d").
                         if (sel.default) |d| {
                             const defv = try self.eval(d, env, pos);
                             return defv;
@@ -366,10 +373,6 @@ pub const EvalState = struct {
                     const l = try self.eval(op.left, env, pos);
                     const r = try self.eval(op.right, env, pos);
                     const eq = try self.eqValues(l, r);
-                    if (self.eq_depth > 500) {
-                    }
-                    if (self.eq_depth > 10000) {
-                    }
                     return .{ .bool_ = if (op.kind == .eq) eq else !eq };
                 },
                 .and_, .or_, .impl => {
@@ -480,7 +483,10 @@ pub const EvalState = struct {
                 const out = try self.alloc.alloc(*Value, elems.len);
                 for (elems, 0..) |e, i| {
                     out[i] = try self.alloc.create(Value);
-                    out[i].* = try self.mkThunk(e, env, pos);
+                    // Evaluate the element expression like Nix: operators and
+                    // variables are checked eagerly (undefined variables
+                    // error), while calls stay lazy (builtins run on force).
+                    out[i].* = try self.eval(e, env, pos);
                 }
                 return .{ .list = out };
             },
@@ -530,11 +536,14 @@ pub const EvalState = struct {
         switch (f) {
             .builtin => |b| {
                 if (b.args.len + 1 == b.arity) {
-                    // full application: collect and call
+                    // full application: collect the args; Nix applies
+                    // builtins lazily (the call runs on first force).
                     const args = try self.alloc.alloc(*Value, b.args.len + 1);
                     @memcpy(args[0..b.args.len], b.args);
                     args[b.args.len] = arg;
-                    return b.f(self, args, pos);
+                    const t = try self.alloc.create(value.Thunk);
+                    t.* = .{ .expr = undefined, .env = undefined, .pos = pos, .builtin = .{ .name = b.name, .arity = b.arity, .args = args, .f = b.f } };
+                    return .{ .thunk = t };
                 }
                 // partial application: return a new builtin with one more arg
                 const nb = try self.alloc.create(value.Builtin);

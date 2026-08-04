@@ -6,6 +6,7 @@
 //!   zix parse FILE        (lex + parse, print nothing on success)
 
 const std = @import("std");
+const builtin = @import("builtin");
 const zix = @import("zix");
 
 const eval = zix.eval;

@@ -99,8 +99,8 @@ functions that use `fetchGit`/`fetchTarball`/`fromTOML` work identically.
 | Task | Effort | Details |
 |---|---|---|
 | Evaluate `import <nixpkgs> {}`'s `lib` | M | **DONE** — `lib` (trivial, attrsets, lists, strings, fixedPoints, customisation, systems, types, modules single-module paths) evaluates and matches Nix. |
-| Construct the `pkgs` attrset | M | **In progress** — top-level bootstrapping works through `impure.nix`/`default.nix`/`systems`; blocked on `lib/modules.nix` deep self-referential recursion (`modules.nix:1075`) during `config` bootstrapping. |
-| Build `hello` from nixpkgs end-to-end | L | Blocked on the `pkgs` attrset. |
+| Construct the `pkgs` attrset | M | **DONE** — `import <nixpkgs> {}` fully evaluates: `pkgs.system`, `pkgs.hello.name = "hello-2.12.3"`, the full stdenv bootstrap (380 drvs). |
+| Build `hello` from nixpkgs end-to-end | L | **In progress** — `pkgs.hello.drvPath` evaluates through the whole stdenv (gcc, glibc, coreutils, ...) and is blocked on a JSON-serialisation cycle: the `__structuredAttrs` env of a derivation contains a derivation value whose `all`-chain (`lib/customisation.nix:409`) recurses during `jsonWrite`. Next step: coerce derivation values in the structured env to their output path before JSON. |
 | Nixpkgs-compat fixes landed | — | trailing comma in formals, `@args` visible in formals defaults, lazy `map`/`mapAttrs` (no false recursion), `builtins.split` capture groups, search-path errors as `ThrownError` (tryEval parity), multi-line string interpolation. |
 | Construct the `pkgs` attrset | M | stdenv bootstrapping: needs `fetchurl`/`fetchTarball` (Phase 2), `derivation` correctness, and `__structuredAttrs`-free path first. |
 | Build `hello` from nixpkgs end-to-end | L | The canonical milestone: `zix build (import <nixpkgs> {}).hello` produces a working binary identical to `nix build`. |

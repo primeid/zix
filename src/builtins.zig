@@ -1394,7 +1394,7 @@ fn primCurrentTime(st: *Eval, args: []const *Value, pos: usize) EvalError!Value 
 
     // epoch seconds (portable via std.Io.Clock)
     const ts = std.Io.Clock.now(.real, fsutil.io);
-    return .{ .int = @divTrunc(ts.nanoseconds, 1_000_000_000) };
+    return .{ .int = @intCast(@divTrunc(ts.nanoseconds, 1_000_000_000)) };
 }
 
 fn primNixVersion(st: *Eval, args: []const *Value, pos: usize) EvalError!Value {

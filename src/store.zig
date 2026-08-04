@@ -273,7 +273,7 @@ test "nar hash matches nix hash path (ground truth from Nix 2.34)" {
     const tmp_root = "/tmp/zix-test-nar";
     var ctr: usize = 0;
     const ts = std.Io.Clock.now(.real, fsutil.io);
-    const stamp: i64 = @divTrunc(ts.nanoseconds, 1_000_000);
+    const stamp: i64 = @intCast(@divTrunc(ts.nanoseconds, 1_000_000));
     const dir = try std.fmt.allocPrint(alloc, "{s}-{d}-{d}", .{ tmp_root, stamp, @atomicRmw(usize, &ctr, .Add, 1, .seq_cst) });
     defer alloc.free(dir);
     defer std.Io.Dir.cwd().deleteTree(fsutil.io, dir) catch {};

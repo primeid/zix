@@ -9,6 +9,7 @@ pub fn build(b: *std.Build) void {
     const lib = b.addModule("zix", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
+        .optimize = optimize,
     });
 
     const exe = b.addExecutable(.{

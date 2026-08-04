@@ -41,11 +41,17 @@ pub const Lambda = struct {
     pos: ast.Pos = .{},
 };
 
+pub const ThunkState = struct {
+    phase: enum { unevaluated, evaluating, done } = .unevaluated,
+    value: Value = .null_,
+};
+
 pub const Thunk = struct {
     expr: *ast.Expr,
     env: *Env,
-    state: enum { unevaluated, evaluating, done } = .unevaluated,
-    value: Value = .null_,
+    /// Shared evaluation state: copies of a thunk (e.g. via variable
+    /// references) must observe the same phase so that cycles are detected.
+    state: *ThunkState,
     pos: usize = 0,
     /// A pending builtin application (Nix applies builtins lazily).
     builtin: ?Builtin = null,

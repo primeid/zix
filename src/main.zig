@@ -418,6 +418,25 @@ fn printValue(st: *eval.EvalState, v: *value.Value, w: *std.array_list.Managed(u
     return printValueSeen(st, v, w, depth, raw, &.{});
 }
 
+fn printAttrName(st: *eval.EvalState, name: []const u8, w: *std.array_list.Managed(u8)) !void {
+    var valid = name.len > 0;
+    for (name, 0..) |c, i| {
+        const ok = if (i == 0)
+            (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or c == '_'
+        else
+            (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_' or c == '-';
+        if (!ok) {
+            valid = false;
+            break;
+        }
+    }
+    if (valid) {
+        try w.appendSlice(name);
+    } else {
+        try w.appendSlice(try std.fmt.allocPrint(st.alloc, "\"{s}\"", .{name}));
+    }
+}
+
 fn printValueSeen(
     st: *eval.EvalState,
     v: *value.Value,
@@ -463,11 +482,9 @@ fn printValueSeen(
             }
         },
         .path => |p| {
-            if (raw) {
-                try w.appendSlice(p.p);
-            } else {
-                try w.appendSlice(try std.fmt.allocPrint(st.alloc, "\"{s}\"", .{p.p}));
-            }
+            // Nix prints store/absolute paths bare (no quotes); only strings
+            // get quoted.
+            try w.appendSlice(p.p);
         },
         .list => |l| {
             if (l.len == 0) {
@@ -515,7 +532,8 @@ fn printValueSeen(
             new_seen[seen.len] = a;
             for (a.items, 0..) |it, i| {
                 if (i > 0) try w.appendSlice("; ");
-                try w.appendSlice(try std.fmt.allocPrint(st.alloc, "{s} = ", .{it.name}));
+                try printAttrName(st, it.name, w);
+                try w.appendSlice(" = ");
                 try printValueSeen(st, it.value, w, depth + 1, raw, new_seen);
             }
             try w.appendSlice("; }");
@@ -532,7 +550,7 @@ fn printValueSeen(
         .builtin => |b| {
             try w.appendSlice("«primop ");
             try w.appendSlice(b.name);
-            try w.append('»');
+            try w.appendSlice("»");
         },
         .thunk => unreachable,
     }

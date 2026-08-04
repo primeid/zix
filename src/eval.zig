@@ -126,7 +126,9 @@ pub const EvalState = struct {
 
     pub fn mkThunk(self: *EvalState, expr: *ast.Expr, env: *Env, pos: usize) EvalError!Value {
         const t = try self.alloc.create(value.Thunk);
-        t.* = .{ .expr = expr, .env = env, .pos = pos };
+        const st = try self.alloc.create(value.ThunkState);
+        st.* = .{};
+        t.* = .{ .expr = expr, .env = env, .state = st, .pos = pos };
         return .{ .thunk = t };
     }
 
@@ -185,25 +187,35 @@ pub const EvalState = struct {
                     }
 
 
-                    switch (t.state) {
+                    switch (t.state.phase) {
                         .evaluating => {
-                            if (self.eval_chain.items.len > 2) {
-                                for (self.eval_chain.items) |cp| {
-                                    std.debug.print("  «{s}»:{d}:{d}\n", .{ cp.file, cp.line, cp.col });
-                                }
-                            }
                             return error.InfiniteRecursion;
                         },
                         .done => {
-                            v.* = t.value;
+                            // A thunk that (transitively) evaluates to itself
+                            // is an infinite recursion, not a value.  Follow
+                            // chains of done thunks (mutual recursion like
+                            // `let y = z; z = y; in y`).
+                            var cur = t.state.value;
+                            var hops: usize = 0;
+                            while (cur == .thunk and cur.thunk.state.phase == .done and hops < 16) : (hops += 1) {
+                                if (cur.thunk.state == t.state) {
+                                    return error.InfiniteRecursion;
+                                }
+                                cur = cur.thunk.state.value;
+                            }
+                            v.* = t.state.value;
                         },
                         .unevaluated => {
-                            if (std.mem.endsWith(u8, t.expr.pos.file, "modules.nix") and t.expr.pos.line == 1075) {
-                            }
-                            t.state = .evaluating;
+                            t.state.phase = .evaluating;
                             const val = try self.eval(t.expr, t.env, t.pos);
-                            t.value = val;
-                            t.state = .done;
+                            // Evaluating to a thunk that shares our state means
+                            // the expression is self-referential.
+                            if (val == .thunk and val.thunk.state == t.state) {
+                                return error.InfiniteRecursion;
+                            }
+                            t.state.value = val;
+                            t.state.phase = .done;
                             v.* = val;
                         },
                     }
@@ -248,8 +260,10 @@ pub const EvalState = struct {
     pub fn eval(self: *EvalState, expr: *const ast.Expr, env: *Env, pos: usize) EvalError!Value {
         self.call_depth += 1;
         defer self.call_depth -= 1;
-        if (self.call_depth > 50000) {
-            return self.userError("stack overflow (possible infinite recursion)", .{});
+        // Nix's max-call-depth is ~9000-10000; keep ours a bit higher so we
+        // never crash before the guard (deep recursion must be a clean error).
+        if (self.call_depth > 20000) {
+            return self.userError("stack overflow; max-call-depth exceeded", .{});
         }
         self.cur_pos = expr.pos;
         self.eval_chain.append(expr.pos) catch {};
@@ -542,7 +556,9 @@ pub const EvalState = struct {
                     @memcpy(args[0..b.args.len], b.args);
                     args[b.args.len] = arg;
                     const t = try self.alloc.create(value.Thunk);
-                    t.* = .{ .expr = undefined, .env = undefined, .pos = pos, .builtin = .{ .name = b.name, .arity = b.arity, .args = args, .f = b.f } };
+                    const ts = try self.alloc.create(value.ThunkState);
+                    ts.* = .{};
+                    t.* = .{ .expr = undefined, .env = undefined, .state = ts, .pos = pos, .builtin = .{ .name = b.name, .arity = b.arity, .args = args, .f = b.f } };
                     return .{ .thunk = t };
                 }
                 // partial application: return a new builtin with one more arg

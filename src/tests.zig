@@ -3,6 +3,7 @@
 
 const std = @import("std");
 const eval = @import("eval.zig");
+const ast = @import("ast.zig");
 const value = @import("value.zig");
 const builtins = @import("builtins.zig");
 
@@ -69,6 +70,103 @@ fn expectEval(alloc: std.mem.Allocator, src: []const u8, expected: []const u8) !
         std.debug.print("eval mismatch:\n  expr:     {s}\n  expected: {s}\n  got:      {s}\n", .{ src, expected, out });
         return error.TestExpectedEqual;
     }
+}
+
+fn evalAndPrintNix(alloc: std.mem.Allocator, src: []const u8) ![]const u8 {
+    // Like evalAndPrint but uses Nix-style formatting (quoted strings).
+    const st = try newState(alloc);
+    defer st.deinit();
+    const parsed = try st.parse(src, "<test>");
+    var v = try st.eval(parsed, st.base_env, 0);
+    var w = std.array_list.Managed(u8).init(alloc);
+    try printTestNix(st, &v, &w, 0);
+    return w.toOwnedSlice();
+}
+
+fn printTestNix(st: *eval.EvalState, v: *value.Value, w: *std.array_list.Managed(u8), depth: usize) !void {
+    if (depth > 50) {
+        try w.appendSlice("...");
+        return;
+    }
+    try st.force(v);
+    switch (v.*) {
+        .int => |i| try w.appendSlice(try std.fmt.allocPrint(st.alloc, "{d}", .{i})),
+        .float => |f| try w.appendSlice(try std.fmt.allocPrint(st.alloc, "{d}", .{f})),
+        .bool_ => |b| try w.appendSlice(if (b) "true" else "false"),
+        .null_ => try w.appendSlice("null"),
+        .string => |s| try w.appendSlice(try std.fmt.allocPrint(st.alloc, "\"{s}\"", .{s.s})),
+        .path => |p| try w.appendSlice(p.p),
+        .list => |l| {
+            try w.appendSlice("[ ");
+            for (l, 0..) |e, i| {
+                if (i > 0) try w.appendSlice(" ");
+                try printTestNix(st, e, w, depth + 1);
+            }
+            if (l.len > 0) try w.appendSlice(" ");
+            try w.appendSlice("]");
+        },
+        .attrs => |a| {
+            try w.appendSlice("{ ");
+            for (a.items, 0..) |it, i| {
+                if (i > 0) try w.appendSlice("; ");
+                try w.appendSlice(try std.fmt.allocPrint(st.alloc, "{s} = ", .{it.name}));
+                try printTestNix(st, it.value, w, depth + 1);
+            }
+            try w.appendSlice("; }");
+        },
+        .lambda => try w.appendSlice("«lambda»"),
+        .builtin => |b| try w.appendSlice(try std.fmt.allocPrint(st.alloc, "«primop {s}»", .{b.name})),
+        .thunk => unreachable,
+    }
+}
+
+fn expectEvalNix(alloc: std.mem.Allocator, src: []const u8, expected: []const u8) !void {
+    const out = try evalAndPrintNix(alloc, src);
+    if (!std.mem.eql(u8, out, expected)) {
+        std.debug.print("eval mismatch (nix fmt):\n  expr:     {s}\n  expected: {s}\n  got:      {s}\n", .{ src, expected, out });
+        return error.TestExpectedEqual;
+    }
+}
+
+const EvalErrCtx = struct {
+    st: *eval.EvalState,
+    parsed: *const ast.Expr,
+    ok: bool = false,
+    err: eval.EvalError = error.InfiniteRecursion,
+};
+fn evalOnBigStack(st: *eval.EvalState, parsed: *const ast.Expr, ok: *bool, err: *eval.EvalError) void {
+    var v = st.eval(parsed, st.base_env, 0) catch |e| {
+        ok.* = false;
+        err.* = e;
+        return;
+    };
+    st.force(&v) catch |e| {
+        ok.* = false;
+        err.* = e;
+        return;
+    };
+    ok.* = true;
+}
+
+fn expectEvalErr(alloc: std.mem.Allocator, src: []const u8, needle: []const u8) !void {
+    const st = try newState(alloc);
+    defer st.deinit();
+    const parsed = try st.parse(src, "<test>");
+    // Run on a large-stack thread: deep recursion must hit the call-depth
+    // guard, not the (small) main-thread stack.
+    var ok = false;
+    var err: eval.EvalError = error.InfiniteRecursion;
+    const t = try std.Thread.spawn(.{ .stack_size = 1 << 30 }, evalOnBigStack, .{ st, parsed, &ok, &err });
+    t.join();
+    if (!ok) {
+        if (std.mem.eql(u8, @errorName(err), needle)) return;
+        // userError: check the message text
+        if (std.mem.eql(u8, @errorName(err), "UserError") and std.mem.indexOf(u8, st.err_msg, needle) != null) return;
+        std.debug.print("eval error mismatch:\n  expr: {s}\n  expected: {s}\n  got: {s}\n", .{ src, needle, @errorName(err) });
+        return error.TestExpectedEqual;
+    }
+    std.debug.print("expected eval error '{s}' but succeeded: {s}\n", .{ needle, src });
+    return error.TestExpectedEqual;
 }
 
 test "eval: arithmetic and operators" {
@@ -250,4 +348,42 @@ test "eval: laziness" {
     try expectEval(a, "false && builtins.abort \"nope\"", "false");
     // seq forces
     try expectEval(a, "builtins.seq 1 2", "2");
+}
+
+test "eval: deep-test regressions (float, split, recursion, toXML, hashes)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // leading-zero floats (Nix's FLOAT regex allows 0.x)
+    try expectEval(a, "1 + 0.5", "1.5");
+    try expectEval(a, "0.5 + 0.5", "1");
+    try expectEval(a, "1 + 0.5e1", "6");
+    // split: capture groups + trailing empty element (std::regex_iterator semantics)
+    try expectEvalNix(a, "builtins.split \"(a)(b)\" \"ab\"", "[ \"\" [ \"a\" \"b\" ] \"\" ]");
+    try expectEvalNix(a, "builtins.split \"-\" \"a-\"", "[ \"a\" [ ] \"\" ]");
+    try expectEvalNix(a, "builtins.split \"\" \"ab\"", "[ \"\" [ ] \"a\" [ ] \"b\" [ ] \"\" ]");
+    // self-referential thunks are infinite recursion, not hangs
+    try expectEvalErr(a, "let x = x; in builtins.seq x 1", "InfiniteRecursion");
+    try expectEvalErr(a, "rec { a = a; }.a", "InfiniteRecursion");
+    try expectEvalErr(a, "let y = z; z = y; in y", "InfiniteRecursion");
+    // deep recursion is a clean stack overflow (not a segfault)
+    try expectEvalErr(a, "let f = x: f x; in f 1", "stack overflow");
+    // listToAttrs keeps the first value for duplicate names
+    try expectEval(a, "builtins.listToAttrs [ { name = \"a\"; value = 1; } { name = \"a\"; value = 2; } ]", "{ a = 1; }");
+    // toXML (checked manually against Nix; string formatting with newlines is
+    // verified via evalAndPrintNix + contains)
+    {
+        const out = try evalAndPrintNix(a, "builtins.toXML 42");
+        if (std.mem.indexOf(u8, out, "<int value=\"42\" />") == null) {
+            std.debug.print("toXML mismatch: {s}\n", .{out});
+            return error.TestExpectedEqual;
+        }
+    }
+    // hashString algorithms
+    try expectEvalNix(a, "builtins.hashString \"md5\" \"abc\"", "\"900150983cd24fb0d6963f7d28e17f72\"");
+    try expectEvalNix(a, "builtins.hashString \"sha512\" \"abc\"", "\"ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f\"");
+    // dirOf returns a path (printed bare)
+    try expectEval(a, "builtins.dirOf /a/b/c.txt", "/a/b");
+    // primop printing includes the closing guillemet
+    try expectEvalNix(a, "builtins.attrValues", "«primop attrValues»");
 }

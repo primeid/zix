@@ -139,12 +139,14 @@ pub fn makeBuiltins(st: *Eval) !Init {
     try B.add(&items, st, "bitNot", 1, primBitNot);
     try B.add(&items, st, "toString", 1, primToString);
     try B.add(&items, st, "toJSON", 1, primToJSON);
+    try B.add(&items, st, "toXML", 1, primToXML);
     try B.add(&items, st, "fromJSON", 1, primFromJSON);
     try B.add(&items, st, "fromTOML", 1, primFromTOML);
     try B.add(&items, st, "map", 2, primMap);
     try B.add(&items, st, "mapAttrs", 2, primMapAttrs);
     try B.add(&items, st, "mapAttrs'", 2, primMapAttrsPrime);
     try B.add(&items, st, "toPath", 1, primToPath);
+    try B.add(&items, st, "addDrvOutputDependencies", 1, primAddDrvOutputDependencies);
     try B.add(&items, st, "filter", 2, primFilter);
     try B.add(&items, st, "foldl'", 3, primFoldl);
     try B.add(&items, st, "genList", 2, primGenList);
@@ -561,6 +563,17 @@ fn primMapAttrsPrime(st: *Eval, args: []const *Value, pos: usize) EvalError!Valu
     return st.mkAttrs(items);
 }
 
+fn primAddDrvOutputDependencies(st: *Eval, args: []const *Value, pos: usize) EvalError!Value {
+    _ = pos;
+    var ctx = std.array_list.Managed(value.CtxElem).init(st.alloc);
+    const s = try forceStringWithCtx(st, args[0], &ctx, false, "while evaluating the argument to builtins.addDrvOutputDependencies");
+    // Nix requires exactly one drv-output element in the string context.
+    if (ctx.items.len != 1 or ctx.items[0].kind != .drv_out) {
+        return st.userError("context of string '{s}' must have exactly one element", .{s});
+    }
+    return st.mkString(try st.alloc.dupe(u8, s), ctx.items);
+}
+
 fn primToPath(st: *Eval, args: []const *Value, pos: usize) EvalError!Value {
     _ = pos;
     const s = try forceStringNoCtx(st, args[0], "while evaluating the argument to builtins.toPath");
@@ -949,10 +962,16 @@ fn primListToAttrs(st: *Eval, args: []const *Value, pos: usize) EvalError!Value 
         const name_v = ev.attrs.find("name") orelse return st.userError("attribute 'name' missing", .{});
         const val_v = ev.attrs.find("value") orelse return st.userError("attribute 'value' missing", .{});
         const name = try forceStringNoCtx(st, name_v, "while evaluating the 'name' attribute");
+        // Nix keeps the FIRST value for a duplicated name (later entries are
+        // silently ignored).
+        var dup = false;
         for (items.items) |it| {
-            if (std.mem.eql(u8, it.name, name)) return st.userError("duplicate attribute '{s}' in 'listToAttrs'", .{name});
+            if (std.mem.eql(u8, it.name, name)) {
+                dup = true;
+                break;
+            }
         }
-        try items.append(.{ .name = name, .value = val_v });
+        if (!dup) try items.append(.{ .name = name, .value = val_v });
     }
     return st.mkAttrs(items.items);
 }
@@ -1294,7 +1313,8 @@ fn primDirOf(st: *Eval, args: []const *Value, pos: usize) EvalError!Value {
     var ctx = std.array_list.Managed(value.CtxElem).init(st.alloc);
     const s = try forceStringWithCtx(st, args[0], &ctx, false, "while evaluating the argument to builtins.dirOf");
     const dir = std.fs.path.dirname(s) orelse ".";
-    return st.mkString(dir, ctx.items);
+    // Nix returns a path (printed without quotes), not a string.
+    return .{ .path = .{ .p = try st.alloc.dupe(u8, dir), .ctx = ctx.items } };
 }
 
 // ---------------------------------------------------------------------------
@@ -1492,11 +1512,25 @@ fn primHashString(st: *Eval, args: []const *Value, pos: usize) EvalError!Value {
 
     const algo = try forceStringNoCtx(st, args[0], "");
     const s = try forceStringNoCtx(st, args[1], "");
-    if (!std.mem.eql(u8, algo, "sha256")) {
+    var hex: [256]u8 = undefined;
+    const out: []const u8 = if (std.mem.eql(u8, algo, "md5")) blk: {
+        var d: [std.crypto.hash.Md5.digest_length]u8 = undefined;
+        std.crypto.hash.Md5.hash(s, &d, .{});
+        break :blk nixhash.base16Encode(&hex, &d);
+    } else if (std.mem.eql(u8, algo, "sha1")) blk: {
+        var d: [std.crypto.hash.Sha1.digest_length]u8 = undefined;
+        std.crypto.hash.Sha1.hash(s, &d, .{});
+        break :blk nixhash.base16Encode(&hex, &d);
+    } else if (std.mem.eql(u8, algo, "sha256")) blk: {
+        break :blk nixhash.base16Encode(&hex, &nixhash.sha256(s));
+    } else if (std.mem.eql(u8, algo, "sha512")) blk: {
+        var d: [std.crypto.hash.sha2.Sha512.digest_length]u8 = undefined;
+        std.crypto.hash.sha2.Sha512.hash(s, &d, .{});
+        break :blk nixhash.base16Encode(&hex, &d);
+    } else {
         return st.userError("unknown hash algorithm '{s}'", .{algo});
-    }
-    const h = nixhash.Hash.of(s);
-    return st.mkString(try h.base16(st.alloc), &.{});
+    };
+    return st.mkString(try st.alloc.dupe(u8, out), &.{});
 }
 
 fn primHashFile(st: *Eval, args: []const *Value, pos: usize) EvalError!Value {
@@ -2773,6 +2807,90 @@ fn primFromTOML(st: *Eval, args: []const *Value, pos: usize) EvalError!Value {
     return st.mkAttrs(items.items);
 }
 
+fn xmlEscape(st: *Eval, s: []const u8) ![]const u8 {
+    if (std.mem.indexOfAny(u8, s, "&<>\"'") == null) return s;
+    var out = std.array_list.Managed(u8).init(st.alloc);
+    for (s) |c| {
+        switch (c) {
+            '&' => try out.appendSlice("&amp;"),
+            '<' => try out.appendSlice("&lt;"),
+            '>' => try out.appendSlice("&gt;"),
+            '"' => try out.appendSlice("&quot;"),
+            '\'' => try out.appendSlice("&apos;"),
+            else => try out.append(c),
+        }
+    }
+    return out.toOwnedSlice();
+}
+
+fn xmlIndent(_: *Eval, w: *std.array_list.Managed(u8), level: usize) !void {
+    var i: usize = 0;
+    while (i < level) : (i += 1) try w.appendSlice("  ");
+}
+
+fn xmlWrite(st: *Eval, v: *Value, w: *std.array_list.Managed(u8), level: usize) EvalError!void {
+    try st.force(v);
+    switch (v.*) {
+        .int => |i| try w.appendSlice(try std.fmt.allocPrint(st.alloc, "<int value=\"{d}\" />", .{i})),
+        .float => |f| try w.appendSlice(try std.fmt.allocPrint(st.alloc, "<float value=\"{d}\" />", .{f})),
+        .bool_ => |b| try w.appendSlice(try std.fmt.allocPrint(st.alloc, "<bool value=\"{s}\" />", .{if (b) "true" else "false"})),
+        .null_ => try w.appendSlice("<null />"),
+        .string => |s2| try w.appendSlice(try std.fmt.allocPrint(st.alloc, "<string value=\"{s}\" />", .{try xmlEscape(st, s2.s)})),
+        .path => |p| try w.appendSlice(try std.fmt.allocPrint(st.alloc, "<path value=\"{s}\" />", .{try xmlEscape(st, p.p)})),
+        .list => |l| {
+            try w.appendSlice("<list>\n");
+            for (l) |e| {
+                try xmlIndent(st, w, level + 1);
+                try xmlWrite(st, e, w, level + 1);
+                try w.append('\n');
+            }
+            try xmlIndent(st, w, level);
+            try w.appendSlice("</list>");
+        },
+        .attrs => |a| {
+            try w.appendSlice("<attrs>\n");
+            for (a.items) |it| {
+                try xmlIndent(st, w, level + 1);
+                try w.appendSlice(try std.fmt.allocPrint(st.alloc, "<attr name=\"{s}\">\n", .{try xmlEscape(st, it.name)}));
+                try xmlIndent(st, w, level + 2);
+                try xmlWrite(st, it.value, w, level + 2);
+                try w.append('\n');
+                try xmlIndent(st, w, level + 1);
+                try w.appendSlice("</attr>\n");
+            }
+            try xmlIndent(st, w, level);
+            try w.appendSlice("</attrs>");
+        },
+        .lambda => |l| {
+            try w.appendSlice("<function>");
+            if (l.params.formals) |f| {
+                try w.append('\n');
+                for (f.formals) |f2| {
+                    try xmlIndent(st, w, level + 1);
+                    try w.appendSlice(try std.fmt.allocPrint(st.alloc, "<varpat name=\"{s}\" />\n", .{try xmlEscape(st, f2.name)}));
+                }
+                try xmlIndent(st, w, level);
+            } else if (l.params.arg) |a| {
+                try w.append('\n');
+                try xmlIndent(st, w, level + 1);
+                try w.appendSlice(try std.fmt.allocPrint(st.alloc, "<varpat name=\"{s}\" />\n", .{try xmlEscape(st, a)}));
+                try xmlIndent(st, w, level);
+            }
+            try w.appendSlice("</function>");
+        },
+        else => return st.userError("cannot convert {s} to XML", .{eval.EvalState.showType(v.*)}),
+    }
+}
+
+fn primToXML(st: *Eval, args: []const *Value, pos: usize) EvalError!Value {
+    _ = pos;
+    var w = std.array_list.Managed(u8).init(st.alloc);
+    try w.appendSlice("<?xml version='1.0' encoding='utf-8'?>\n<expr>\n  ");
+    try xmlWrite(st, args[0], &w, 1);
+    try w.appendSlice("\n</expr>\n");
+    return st.mkString(try st.alloc.dupe(u8, w.items), &.{});
+}
+
 fn primFromJSON(st: *Eval, args: []const *Value, pos: usize) EvalError!Value {
     _ = pos;
 
@@ -3210,18 +3328,20 @@ fn regexMatch(st: *Eval, pat: []const u8, s: []const u8) EvalError!Value {
 }
 
 fn regexSplit(st: *Eval, pat: []const u8, s: []const u8) EvalError!Value {
+    // Mirrors Nix's `prim_split` (std::regex_iterator semantics): each match
+    // contributes its prefix text and its capture groups; the suffix of the
+    // last match is appended even when empty.
     const re = try regexParse(st, pat);
     var out = std.array_list.Managed(*Value).init(st.alloc);
     var pos: usize = 0;
-    while (pos < s.len) {
+    var prev_end: usize = 0;
+    var last_end: usize = 0;
+    var found = false;
+    while (true) {
         const m = (try regexFindMatch(st, &re, s, pos, false)) orelse break;
-        if (m.end == m.mstart) {
-            // empty match: advance one char to make progress
-            pos += 1;
-            continue;
-        }
+        found = true;
         const v = try st.alloc.create(Value);
-        v.* = st.mkString(s[pos..m.mstart], &.{});
+        v.* = st.mkString(s[prev_end..m.mstart], &.{});
         try out.append(v);
         const caps = try st.alloc.alloc(*Value, re.ngroups);
         for (0..re.ngroups) |i| {
@@ -3236,12 +3356,19 @@ fn regexSplit(st: *Eval, pat: []const u8, s: []const u8) EvalError!Value {
         const mv = try st.alloc.create(Value);
         mv.* = .{ .list = caps };
         try out.append(mv);
-        pos = m.end;
+        last_end = m.end;
+        prev_end = m.end;
+        // std::regex_iterator advances one char after an empty match.
+        pos = if (m.end == m.mstart) m.mstart + 1 else m.end;
     }
-    if (pos < s.len) {
-        const last = try st.alloc.create(Value);
-        last.* = st.mkString(s[pos..], &.{});
-        try out.append(last);
+    if (!found) {
+        const whole = try st.alloc.create(Value);
+        whole.* = st.mkString(s, &.{});
+        try out.append(whole);
+        return .{ .list = out.items };
     }
+    const suffix = try st.alloc.create(Value);
+    suffix.* = st.mkString(s[last_end..], &.{});
+    try out.append(suffix);
     return .{ .list = out.items };
 }

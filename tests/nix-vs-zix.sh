@@ -177,7 +177,7 @@ cmp1 "fromJSON arr" 'builtins.fromJSON "[1, \"two\"]"'
 # ---- misc builtins ----
 cmp1 "hashString" 'builtins.hashString "sha256" "hello"'
 cmp1 "baseNameOf" 'builtins.baseNameOf "/a/b/c.txt"'
-cmp1 "dirOf" 'builtins.dirOf "/a/b/c.txt"'
+cmp1 "dirOf" 'builtins.dirOf /a/b/c.txt'  # path, printed bare'
 cmp1 "getEnv empty" 'builtins.getEnv "ZIX_NONEXISTENT_XYZ"'
 cmp1 "seq" 'builtins.seq 1 2'
 cmp1 "deepSeq" 'builtins.deepSeq { a = [1 2]; } 3'

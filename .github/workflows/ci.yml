@@ -54,5 +54,8 @@ jobs:
         run: zig build test
 
       - name: Smoke test (evaluate a derivation)
+        shell: bash
         run: |
-          zig-out/bin/zix eval --read-only -E '(builtins.derivation { name = "ci-check"; system = "x86_64-linux"; builder = "/bin/sh"; }).drvPath'
+          ZIX=zig-out/bin/zix
+          [ -x "$ZIX" ] || ZIX=zig-out/bin/zix.exe
+          "$ZIX" eval --read-only -E '(builtins.derivation { name = "ci-check"; system = "x86_64-linux"; builder = "/bin/sh"; }).drvPath'

@@ -14,7 +14,11 @@ const value = zix.value;
 pub fn main(init: std.process.Init) !void {
     const a = init.arena.allocator();
 
-    var args_iter = std.process.Args.Iterator.init(init.minimal.args);
+    var args_iter = switch (builtin.os.tag) {
+        .windows => try std.process.Args.Iterator.initAllocator(init.minimal.args, a),
+        else => std.process.Args.Iterator.init(init.minimal.args),
+    };
+    defer args_iter.deinit();
     var argv = std.array_list.Managed([]const u8).init(a);
     while (args_iter.next()) |arg| {
         try argv.append(try a.dupe(u8, arg));

@@ -52,6 +52,11 @@ pub fn build(b: *std.Build) void {
     build_step.dependOn(&build_cmd.step);
     build_cmd.step.dependOn(b.getInstallStep());
 
+    const fuzz_step = b.step("fuzz", "Fuzz smoke: random inputs must not crash the CLI");
+    const fuzz_cmd = b.addSystemCommand(&.{ "bash", "tests/fuzz.sh" });
+    fuzz_step.dependOn(&fuzz_cmd.step);
+    fuzz_cmd.step.dependOn(b.getInstallStep());
+
     const lang_step = b.step("lang", "Run the golden language tests (tests/lang)");
     const lang_cmd = b.addSystemCommand(&.{ "bash", "tests/run-lang.sh" });
     lang_step.dependOn(&lang_cmd.step);

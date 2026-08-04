@@ -523,14 +523,7 @@ pub const EvalState = struct {
                 return .{ .builtin = nb.* };
             },
             .lambda => |lam| return self.callLambda(lam, arg, pos),
-            else => {
-                var names_buf = std.array_list.Managed(u8).init(self.alloc);
-                for (f.attrs.items) |it| {
-                    names_buf.appendSlice(it.name) catch {};
-                    names_buf.append(' ') catch {};
-                }
-                return self.userError("attempt to call something which is not a function but {s}", .{showType(f)});
-            },
+            else => return self.userError("attempt to call something which is not a function but {s}", .{showType(f)}),
         }
     }
 

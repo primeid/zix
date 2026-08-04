@@ -89,15 +89,21 @@ results — language, builtins and derivation paths. See
 
 ## Roadmap
 
-The big picture — ideally as a [contribution](CONTRIBUTING.md):
+The big picture — a detailed, phased plan with milestones and verification
+criteria lives in **[ROADMAP.md](ROADMAP.md)**. The short version:
 
-- [ ] **The realisation layer** (`zix build`): run builders in a sandbox and
-      produce outputs. The evaluation side is complete; the execution side remains.
-- [ ] **More builtins**: `fetchGit`, `fetchTarball`, `fromTOML`,
+- [ ] **The realisation layer** (`zix build`): run builders (sandboxed, on
+      POSIX) and produce outputs. Evaluation is complete; execution remains.
+- [ ] **More builtins**: `fetchGit`, `fetchTarball`, `fetchurl`, `fromTOML`,
       `__structuredAttrs`, `builtins.path` flags, `scopedImport`,
       dynamic derivations.
-- [ ] **Nixpkgs evaluation**: `import <nixpkgs> {}` at full scale.
-- [ ] **Position tracking** in the AST (for error messages and `«lambda @ …»` output).
+- [ ] **Nixpkgs evaluation**: `import <nixpkgs> {}` at full scale (milestone:
+      `zix build (import <nixpkgs> {}).hello`).
+- [ ] **Position tracking** in the AST (Nix-style error messages and
+      `«lambda @ «file»:line:col»` output).
+
+Ideally as a [contribution](CONTRIBUTING.md) — Phase 4 (positions) is the best
+starting point for new contributors.
 
 ## Known deviations from Nix
 

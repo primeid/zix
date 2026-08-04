@@ -85,6 +85,15 @@ pub fn buildOne(
     for (drv.env) |e| {
         env.put(e.name, e.value) catch return error.OutOfMemory;
     }
+    // Structured attributes: write the __json blob to a file and point
+    // NIX_ATTRS_JSON_FILE at it (like Nix's `__structuredAttrs`).
+    if (env.get("__json")) |json| {
+        const json_file = try std.fmt.allocPrint(alloc, "{s}/attrs.json", .{build_dir});
+        fsutil.makePath(build_dir) catch {};
+        fsutil.writeFile(json_file, json) catch return error.IoError;
+        env.put("NIX_ATTRS_JSON_FILE", json_file) catch return error.OutOfMemory;
+        env.put("NIX_ATTRS_SH_FILE", try std.fmt.allocPrint(alloc, "{s}/attrs.sh", .{build_dir})) catch return error.OutOfMemory;
+    }
     const defaults = [_][]const u8{ "PATH", "HOME", "TMPDIR", "TEMP", "LANG", "LC_ALL" };
     for (defaults) |d| {
         if (env.get(d) == null) {

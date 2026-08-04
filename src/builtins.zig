@@ -137,6 +137,7 @@ pub fn makeBuiltins(st: *Eval) !Init {
     try B.add(&items, st, "toString", 1, primToString);
     try B.add(&items, st, "toJSON", 1, primToJSON);
     try B.add(&items, st, "fromJSON", 1, primFromJSON);
+    try B.add(&items, st, "fromTOML", 1, primFromTOML);
     try B.add(&items, st, "map", 2, primMap);
     try B.add(&items, st, "filter", 2, primFilter);
     try B.add(&items, st, "foldl'", 3, primFoldl);
@@ -200,6 +201,10 @@ pub fn makeBuiltins(st: *Eval) !Init {
     try B.add(&items, st, "getEnv", 1, primGetEnv);
     try B.add(&items, st, "unsafeGetAttrPos", 2, primUnsafeGetAttrPos);
     try B.add(&items, st, "derivationStrict", 1, primDerivationStrict);
+    try B.add(&items, st, "fetchurl", 1, primFetchurl);
+    try B.add(&items, st, "fetchTarball", 1, primFetchTarball);
+    try B.add(&items, st, "fetchzip", 1, primFetchTarball);
+    try B.add(&items, st, "fetchGit", 1, primFetchGit);
     try B.add(&items, st, "placeholder", 1, primPlaceholder);
     try B.add(&items, st, "import", 1, primImport);
     try B.add(&items, st, "scopedImport", 2, primScopedImport);
@@ -1693,6 +1698,196 @@ fn primUnsafeDiscardStringContext(st: *Eval, args: []const *Value, pos: usize) E
 }
 
 // ---------------------------------------------------------------------------
+// Fetching (curl subprocess; documented dependency)
+// ---------------------------------------------------------------------------
+
+fn curlDownload(st: *Eval, url: []const u8, dest: []const u8) EvalError!void {
+    var argv = std.array_list.Managed([]const u8).init(st.alloc);
+    try argv.appendSlice(&.{ "curl", "-L", "-sS", "-o", dest, url });
+    var child = std.process.spawn(fsutil.io, .{
+        .argv = argv.items,
+        .stdout = .ignore,
+        .stderr = .inherit,
+        .stdin = .ignore,
+    }) catch |e| {
+        return st.userError("cannot run curl: {s}", .{@errorName(e)});
+    };
+    const term = child.wait(fsutil.io) catch return st.userError("curl failed", .{});
+    switch (term) {
+        .exited => |code| if (code != 0) return st.userError("curl failed to download '{s}' (exit {d})", .{ url, code }),
+        else => return st.userError("curl terminated abnormally", .{}),
+    }
+}
+
+fn fetchArgs(st: *Eval, a: *value.Attrs, what: []const u8) EvalError!struct { url: []const u8, name: []const u8, hash: ?[]const u8 } {
+    const url_v = a.find("url") orelse return st.userError("attribute 'url' missing in builtins.{s}", .{what});
+    var uv = url_v.*;
+    const url = try forceStringNoCtx(st, &uv, "while evaluating the 'url' attribute");
+    var name: []const u8 = "source";
+    if (a.find("name")) |nv| {
+        var n2 = nv.*;
+        name = try forceStringNoCtx(st, &n2, "while evaluating the 'name' attribute");
+    }
+    var hash: ?[]const u8 = null;
+    if (a.find("sha256")) |hv| {
+        var h2 = hv.*;
+        hash = try forceStringNoCtx(st, &h2, "while evaluating the 'sha256' attribute");
+    } else if (a.find("narHash")) |hv| {
+        var h2 = hv.*;
+        hash = try forceStringNoCtx(st, &h2, "while evaluating the 'narHash' attribute");
+    }
+    return .{ .url = url, .name = name, .hash = hash };
+}
+
+fn primFetchurl(st: *Eval, args: []const *Value, pos: usize) EvalError!Value {
+    _ = pos;
+    const a = try forceAttrs(st, args[0], "while evaluating the argument to builtins.fetchurl");
+    const fa = try fetchArgs(st, a, "fetchurl");
+    const tmp = try std.fmt.allocPrint(st.alloc, "/tmp/zix-fetch-{d}", .{std.Io.Clock.now(.real, fsutil.io).nanoseconds});
+    try curlDownload(st, fa.url, tmp);
+    const contents = fsutil.readFileAlloc(st.alloc, tmp, 1 << 30) catch |e| {
+        return st.userError("cannot read downloaded file: {s}", .{@errorName(e)});
+    };
+    const hash = store.Hash.of(contents);
+    if (fa.hash) |hs| {
+        const eh = nixhash.parseHash(st.alloc, hs) catch return st.userError("invalid hash '{s}'", .{hs});
+        if (!eh.eql(hash)) {
+            return st.userError("hash mismatch in builtins.fetchurl: expected {s} but got {s}", .{ try eh.base16(st.alloc), try hash.base16(st.alloc) });
+        }
+    }
+    const sp = st.store.makeFixedOutputPath(fa.name, .flat, hash, &.{}) catch |e| {
+        return st.userError("cannot compute store path: {s}", .{@errorName(e)});
+    };
+    if (!st.store.read_only) {
+        fsutil.makePath(st.store.store_dir) catch {};
+        fsutil.writeFile(sp, contents) catch |e| {
+            return st.userError("cannot write to store: {s}", .{@errorName(e)});
+        };
+    }
+    var ctx = std.array_list.Managed(value.CtxElem).init(st.alloc);
+    try ctx.append(.{ .kind = .opaq, .path = sp });
+    return st.mkString(sp, ctx.items);
+}
+
+fn primFetchTarball(st: *Eval, args: []const *Value, pos: usize) EvalError!Value {
+    _ = pos;
+    const a = try forceAttrs(st, args[0], "while evaluating the argument to builtins.fetchTarball");
+    const fa = try fetchArgs(st, a, "fetchTarball");
+    const stamp = std.Io.Clock.now(.real, fsutil.io).nanoseconds;
+    const tmp = try std.fmt.allocPrint(st.alloc, "/tmp/zix-fetch-{d}", .{stamp});
+    const dir = try std.fmt.allocPrint(st.alloc, "/tmp/zix-fetch-dir-{d}", .{stamp});
+    try curlDownload(st, fa.url, tmp);
+    // unpack: tar auto-detects .tar.gz/.zip
+    var argv = std.array_list.Managed([]const u8).init(st.alloc);
+    try argv.appendSlice(&.{ "tar", "-xf", tmp, "-C", dir });
+    fsutil.makePath(dir) catch {};
+    var child = std.process.spawn(fsutil.io, .{
+        .argv = argv.items,
+        .stdout = .ignore,
+        .stderr = .inherit,
+        .stdin = .ignore,
+    }) catch |e| {
+        return st.userError("cannot run tar: {s}", .{@errorName(e)});
+    };
+    const term = child.wait(fsutil.io) catch return st.userError("tar failed", .{});
+    switch (term) {
+        .exited => |code| if (code != 0) return st.userError("tar failed to unpack '{s}' (exit {d})", .{ fa.url, code }),
+        else => return st.userError("tar terminated abnormally", .{}),
+    }
+    // The `sha256`/`narHash` attribute is the NAR hash of the unpacked source
+    // tree.  Like Nix, if the tarball has a single top-level entry we hash
+    // that entry (the tarball root) rather than the extraction wrapper dir.
+    var root = dir;
+    const names = fsutil.readDirNames(st.alloc, dir) catch return st.userError("cannot read unpacked tarball", .{});
+    if (names.len == 1) {
+        root = try std.fs.path.join(st.alloc, &.{ dir, names[0] });
+    }
+    const hash = store.hashRecursive(st.alloc, root) catch return st.userError("cannot hash unpacked tarball", .{});
+    if (fa.hash) |hs| {
+        const eh = nixhash.parseHash(st.alloc, hs) catch return st.userError("invalid hash '{s}'", .{hs});
+        if (!eh.eql(hash)) {
+            return st.userError("hash mismatch in builtins.fetchTarball: expected {s} but got {s}", .{ try eh.base16(st.alloc), try hash.base16(st.alloc) });
+        }
+    }
+    const sp = st.store.makeFixedOutputPath(fa.name, .recursive, hash, &.{}) catch |e| {
+        return st.userError("cannot compute store path: {s}", .{@errorName(e)});
+    };
+    if (!st.store.read_only) {
+        fsutil.makePath(st.store.store_dir) catch {};
+        _ = store.addToStoreWrite(&st.store, fa.name, dir, .recursive) catch |e| {
+            return st.userError("cannot write to store: {s}", .{@errorName(e)});
+        };
+    }
+    var ctx = std.array_list.Managed(value.CtxElem).init(st.alloc);
+    try ctx.append(.{ .kind = .opaq, .path = sp });
+    return st.mkString(sp, ctx.items);
+}
+
+fn runGit(st: *Eval, args: []const []const u8, what: []const u8) EvalError!void {
+    var argv = std.array_list.Managed([]const u8).init(st.alloc);
+    try argv.append("git");
+    for (args) |a| try argv.append(a);
+    var child = std.process.spawn(fsutil.io, .{
+        .argv = argv.items,
+        .stdout = .ignore,
+        .stderr = .inherit,
+        .stdin = .ignore,
+    }) catch |e| {
+        return st.userError("cannot run git: {s}", .{@errorName(e)});
+    };
+    const term = child.wait(fsutil.io) catch return st.userError("git failed", .{});
+    switch (term) {
+        .exited => |code| if (code != 0) return st.userError("git {s} failed (exit {d})", .{ what, code }),
+        else => return st.userError("git {s} terminated abnormally", .{what}),
+    }
+}
+
+fn primFetchGit(st: *Eval, args: []const *Value, pos: usize) EvalError!Value {
+    _ = pos;
+    const a = try forceAttrs(st, args[0], "while evaluating the argument to builtins.fetchGit");
+    const url_v = a.find("url") orelse return st.userError("attribute 'url' missing in builtins.fetchGit", .{});
+    var uv = url_v.*;
+    const url = try forceStringNoCtx(st, &uv, "while evaluating the 'url' attribute");
+    var name: []const u8 = "source";
+    if (a.find("name")) |nv| {
+        var n2 = nv.*;
+        name = try forceStringNoCtx(st, &n2, "while evaluating the 'name' attribute");
+    }
+    var rev: ?[]const u8 = null;
+    if (a.find("rev")) |rv| {
+        var r2 = rv.*;
+        rev = try forceStringNoCtx(st, &r2, "while evaluating the 'rev' attribute");
+    }
+    var ref_name: ?[]const u8 = null;
+    if (a.find("ref")) |rv| {
+        var r2 = rv.*;
+        ref_name = try forceStringNoCtx(st, &r2, "while evaluating the 'ref' attribute");
+    }
+    const stamp = std.Io.Clock.now(.real, fsutil.io).nanoseconds;
+    const dir = try std.fmt.allocPrint(st.alloc, "/tmp/zix-git-{d}", .{stamp});
+    fsutil.makePath(dir) catch {};
+    try runGit(st, &.{ "clone", "--quiet", url, dir }, "clone");
+    if (rev) |r| {
+        try runGit(st, &.{ "-C", dir, "checkout", "--quiet", r }, "checkout");
+    } else if (ref_name) |rf| {
+        try runGit(st, &.{ "-C", dir, "checkout", "--quiet", rf }, "checkout");
+    }
+    const hash = store.hashRecursive(st.alloc, dir) catch return st.userError("cannot hash git tree", .{});
+    const sp = st.store.makeFixedOutputPath(name, .recursive, hash, &.{}) catch |e| {
+        return st.userError("cannot compute store path: {s}", .{@errorName(e)});
+    };
+    if (!st.store.read_only) {
+        fsutil.makePath(st.store.store_dir) catch {};
+        _ = store.addToStoreWrite(&st.store, name, dir, .recursive) catch |e| {
+            return st.userError("cannot write to store: {s}", .{@errorName(e)});
+        };
+    }
+    var ctx = std.array_list.Managed(value.CtxElem).init(st.alloc);
+    try ctx.append(.{ .kind = .opaq, .path = sp });
+    return st.mkString(sp, ctx.items);
+}
+
+// ---------------------------------------------------------------------------
 // Derivations
 // ---------------------------------------------------------------------------
 
@@ -1749,7 +1944,9 @@ fn derivationStrictInternal(st: *Eval, drv_name: []const u8, attrs: *value.Attrs
     var ignore_nulls = false;
     if (attrs.find("__ignoreNulls")) |v| ignore_nulls = try forceBool(st, v, "");
 
-    var env = std.array_list.Managed(drvmod.EnvPair).init(st.alloc);
+        var structured_attrs = false;
+    var json_entries = std.array_list.Managed(value.Item).init(st.alloc);
+var env = std.array_list.Managed(drvmod.EnvPair).init(st.alloc);
     var args_list = std.array_list.Managed([]const u8).init(st.alloc);
     var context = std.array_list.Managed(value.CtxElem).init(st.alloc);
     var content_addressed = false;
@@ -1790,6 +1987,11 @@ fn derivationStrictInternal(st: *Eval, drv_name: []const u8, attrs: *value.Attrs
         // default: environment variable (coerced with store copying)
         const s = try st.coerceToString(&v, &context, true, true, "while evaluating a derivation attribute");
         try env.append(.{ .name = it.name, .value = s });
+        if (structured_attrs) {
+            const copy = try st.alloc.create(Value);
+            copy.* = v;
+            try json_entries.append(.{ .name = it.name, .value = copy });
+        }
         if (std.mem.eql(u8, it.name, "builder")) builder = s;
         if (std.mem.eql(u8, it.name, "system")) platform = s;
         if (std.mem.eql(u8, it.name, "outputHash")) output_hash = s;
@@ -1803,12 +2005,31 @@ fn derivationStrictInternal(st: *Eval, drv_name: []const u8, attrs: *value.Attrs
                 return st.userError("invalid value '{s}' for 'outputHashMode' attribute", .{s});
             }
         }
+        if (std.mem.eql(u8, it.name, "__structuredAttrs")) {
+            try st.force(&v);
+            structured_attrs = v == .bool_ and v.bool_;
+            continue;
+        }
         if (std.mem.eql(u8, it.name, "outputs")) {
             outputs.clearRetainingCapacity();
             var it_tok = std.mem.tokenizeAny(u8, s, " \t\n");
             while (it_tok.next()) |o| try outputs.append(o);
             if (outputs.items.len == 0) return st.userError("derivation cannot have an empty set of outputs", .{});
         }
+    }
+
+    if (structured_attrs) {
+        var jw = std.array_list.Managed(u8).init(st.alloc);
+        try jw.appendSlice("{");
+        for (json_entries.items, 0..) |je, idx| {
+            if (idx > 0) try jw.appendSlice(",");
+            try jw.appendSlice("\"");
+            try jw.appendSlice(escapeJsonString(je.name));
+            try jw.appendSlice("\":");
+            try jsonWrite(st, je.value, &jw);
+        }
+        try jw.appendSlice("}");
+        try env.append(.{ .name = "__json", .value = try st.alloc.dupe(u8, jw.items) });
     }
 
     if (builder.len == 0) return st.userError("required attribute 'builder' missing", .{});
@@ -1972,6 +2193,21 @@ fn setEnv(st: *Eval, env: *std.array_list.Managed(drvmod.EnvPair), name: []const
 // ---------------------------------------------------------------------------
 // JSON
 // ---------------------------------------------------------------------------
+
+fn escapeJsonString(s: []const u8) []const u8 {
+    var out = std.array_list.Managed(u8).init(std.heap.page_allocator);
+    for (s) |c| {
+        switch (c) {
+            '"' => out.appendSlice("\"") catch {},
+            '\\' => out.appendSlice("\\\\") catch {},
+            '\n' => out.appendSlice("\\n") catch {},
+            '\r' => out.appendSlice("\\r") catch {},
+            '\t' => out.appendSlice("\\t") catch {},
+            else => out.append(c) catch {},
+        }
+    }
+    return out.toOwnedSlice() catch "";
+}
 
 fn jsonWrite(st: *Eval, v: *Value, w: *std.array_list.Managed(u8)) EvalError!void {
     try st.force(v);
@@ -2176,6 +2412,236 @@ const JsonParser = struct {
         return st.userError("unterminated JSON string", .{});
     }
 };
+
+// ---------------------------------------------------------------------------
+// TOML (minimal parser: tables, arrays, inline tables, scalars, dates→string)
+// ---------------------------------------------------------------------------
+
+const TomlParser = struct {
+    alloc: std.mem.Allocator,
+    s: []const u8,
+    i: usize = 0,
+    line: usize = 1,
+
+    fn err(self: *TomlParser, st: *Eval, comptime msg: []const u8) EvalError {
+        return st.userError("{s} (TOML line {d})", .{ msg, self.line });
+    }
+
+    fn skipWs(self: *TomlParser) void {
+        while (self.i < self.s.len) {
+            switch (self.s[self.i]) {
+                ' ', '\t' => self.i += 1,
+                '\n' => {
+                    self.i += 1;
+                    self.line += 1;
+                },
+                '#' => {
+                    while (self.i < self.s.len and self.s[self.i] != '\n') self.i += 1;
+                },
+                else => return,
+            }
+        }
+    }
+
+    fn peek(self: *TomlParser) ?u8 {
+        if (self.i >= self.s.len) return null;
+        return self.s[self.i];
+    }
+
+    fn parseValue(self: *TomlParser, st: *Eval) EvalError!Value {
+        self.skipWs();
+        const c = self.peek() orelse return self.err(st, "unexpected end of TOML");
+        return switch (c) {
+            '\"' => blk: {
+                self.i += 1;
+                var out = std.array_list.Managed(u8).init(self.alloc);
+                while (self.i < self.s.len and self.s[self.i] != '"') {
+                    if (self.s[self.i] == '\\' and self.i + 1 < self.s.len) {
+                        const e = self.s[self.i + 1];
+                        self.i += 2;
+                        try out.append(switch (e) {
+                            'n' => '\n',
+                            't' => '\t',
+                            'r' => '\r',
+                            '"' => '"',
+                            '\\' => '\\',
+                            else => e,
+                        });
+                    } else {
+                        try out.append(self.s[self.i]);
+                        self.i += 1;
+                    }
+                }
+                self.i += 1;
+                break :blk st.mkString(try self.alloc.dupe(u8, out.items), &.{});
+            },
+            '[' => blk: {
+                self.i += 1;
+                var elems = std.array_list.Managed(*Value).init(self.alloc);
+                while (true) {
+                    self.skipWs();
+                    if (self.peek() == null or self.peek().? == ']') {
+                        self.i += 1;
+                        break;
+                    }
+                    const v = try self.parseValue(st);
+                    const p = try self.alloc.create(Value);
+                    p.* = v;
+                    try elems.append(p);
+                    self.skipWs();
+                    if (self.peek() == ',') self.i += 1;
+                }
+                break :blk .{ .list = elems.items };
+            },
+            '{' => blk: {
+                self.i += 1;
+                var items = std.array_list.Managed(value.Item).init(self.alloc);
+                while (true) {
+                    self.skipWs();
+                    if (self.peek() == null or self.peek().? == '}') {
+                        self.i += 1;
+                        break;
+                    }
+                    const name = try self.parseKey(st);
+                    self.skipWs();
+                    if (self.peek() != '=') return self.err(st, "expected '=' in inline table");
+                    self.i += 1;
+                    const v = try self.parseValue(st);
+                    const p = try self.alloc.create(Value);
+                    p.* = v;
+                    try items.append(.{ .name = name, .value = p });
+                    self.skipWs();
+                    if (self.peek() == ',') self.i += 1;
+                }
+                break :blk st.mkAttrs(items.items);
+            },
+            't' => blk: {
+                if (self.s.len >= self.i + 4 and std.mem.eql(u8, self.s[self.i .. self.i + 4], "true")) {
+                    self.i += 4;
+                    break :blk .{ .bool_ = true };
+                }
+                return self.err(st, "invalid TOML value");
+            },
+            'f' => blk: {
+                if (self.s.len >= self.i + 5 and std.mem.eql(u8, self.s[self.i .. self.i + 5], "false")) {
+                    self.i += 5;
+                    break :blk .{ .bool_ = false };
+                }
+                return self.err(st, "invalid TOML value");
+            },
+            else => blk: {
+                // number or date (dates become strings, like Nix)
+                const start = self.i;
+                while (self.i < self.s.len and self.s[self.i] != '\n' and self.s[self.i] != ',' and self.s[self.i] != ']' and self.s[self.i] != '}' and self.s[self.i] != '#') self.i += 1;
+                const text = std.mem.trim(u8, self.s[start..self.i], " ");
+                if (text.len == 0) return self.err(st, "invalid TOML value");
+                if (std.mem.indexOfAny(u8, text, ":-") != null and text.len >= 8 and text[4] == '-') {
+                    // Nix does not support dates/times in TOML
+                    return self.err(st, "Dates and times are not supported");
+                }
+                if (std.mem.indexOfScalar(u8, text, '.') != null or std.mem.indexOfAny(u8, text, "eE") != null) {
+                    const f = std.fmt.parseFloat(f64, text) catch return self.err(st, "invalid TOML number");
+                    break :blk .{ .float = f };
+                }
+                const n = std.fmt.parseInt(i64, text, 10) catch return self.err(st, "invalid TOML integer");
+                break :blk .{ .int = n };
+            },
+        };
+    }
+
+    fn parseKey(self: *TomlParser, st: *Eval) EvalError![]const u8 {
+        const start = self.i;
+        while (self.i < self.s.len and (std.ascii.isAlphanumeric(self.s[self.i]) or self.s[self.i] == '_' or self.s[self.i] == '-')) self.i += 1;
+        if (self.i == start) return self.err(st, "expected key");
+        return self.s[start..self.i];
+    }
+
+    const Entry = struct {
+        path: []const []const u8,
+        key: []const u8,
+        value: Value,
+    };
+
+    fn parseInto(self: *TomlParser, st: *Eval, out: *std.array_list.Managed(value.Item)) EvalError!void {
+        var table_path = std.array_list.Managed([]const u8).init(self.alloc);
+        var entries = std.array_list.Managed(Entry).init(self.alloc);
+        while (true) {
+            self.skipWs();
+            if (self.i >= self.s.len) break;
+            if (self.peek().? == '[') {
+                self.i += 1;
+                table_path.clearRetainingCapacity();
+                while (true) {
+                    const k = try self.parseKey(st);
+                    try table_path.append(k);
+                    self.skipWs();
+                    if (self.peek() == ']') {
+                        self.i += 1;
+                        break;
+                    }
+                    if (self.peek() == '.') self.i += 1;
+                }
+                self.skipWs();
+                if (self.i < self.s.len and self.s[self.i] == '\n') {
+                    self.i += 1;
+                    self.line += 1;
+                }
+                continue;
+            }
+            const key = try self.parseKey(st);
+            self.skipWs();
+            if (self.peek() != '=') return self.err(st, "expected '=' after key");
+            self.i += 1;
+            const v = try self.parseValue(st);
+            self.skipWs();
+            if (self.i < self.s.len and self.s[self.i] == '\n') {
+                self.i += 1;
+                self.line += 1;
+            }
+            try entries.append(.{ .path = table_path.items, .key = key, .value = v });
+        }
+        // Build the nested attr tree from the collected entries.
+        try buildTable(st, out, entries.items, 0);
+    }
+
+    fn buildTable(
+        st: *Eval,
+        items: *std.array_list.Managed(value.Item),
+        entries: []const Entry,
+        depth: usize,
+    ) EvalError!void {
+        var i: usize = 0;
+        while (i < entries.len) {
+            const e = entries[i];
+            if (e.path.len == depth) {
+                const p = try st.alloc.create(Value);
+                p.* = e.value;
+                try items.append(.{ .name = e.key, .value = p });
+                i += 1;
+                continue;
+            }
+            // group entries sharing this path prefix
+            const seg = e.path[depth];
+            const start = i;
+            while (i < entries.len and entries[i].path.len > depth and std.mem.eql(u8, entries[i].path[depth], seg)) i += 1;
+            const sub_items = try st.alloc.create(std.array_list.Managed(value.Item));
+            sub_items.* = std.array_list.Managed(value.Item).init(st.alloc);
+            try buildTable(st, sub_items, entries[start..i], depth + 1);
+            const sub = try st.alloc.create(Value);
+            sub.* = try st.mkAttrs(sub_items.items);
+            try items.append(.{ .name = seg, .value = sub });
+        }
+    }
+};
+
+fn primFromTOML(st: *Eval, args: []const *Value, pos: usize) EvalError!Value {
+    _ = pos;
+    const s = try forceStringNoCtx(st, args[0], "while evaluating the argument to builtins.fromTOML");
+    var p = TomlParser{ .alloc = st.alloc, .s = s };
+    var items = std.array_list.Managed(value.Item).init(st.alloc);
+    try p.parseInto(st, &items);
+    return st.mkAttrs(items.items);
+}
 
 fn primFromJSON(st: *Eval, args: []const *Value, pos: usize) EvalError!Value {
     _ = pos;

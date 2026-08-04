@@ -31,6 +31,7 @@ pub fn main(init: std.process.Init) !void {
     var expr_mode = false;
     var raw = false;
     var json = false;
+    var sandbox = false;
     var read_only = false;
     var store_dir: []const u8 = init.environ_map.get("ZIX_STORE_DIR") orelse "/nix/store";
     var nix_path_extra = std.array_list.Managed([]const u8).init(a);
@@ -64,6 +65,8 @@ pub fn main(init: std.process.Init) !void {
             try nix_path_extra.append(argv.items[i]);
         } else if (std.mem.eql(u8, arg, "--json")) {
             json = true;
+        } else if (std.mem.eql(u8, arg, "--sandbox") or std.mem.eql(u8, arg, "--no-sandbox")) {
+            sandbox = std.mem.eql(u8, arg, "--sandbox");
         } else if (std.mem.eql(u8, arg, "-A")) {
             i += 1;
             if (i >= argv.items.len) {
@@ -220,7 +223,7 @@ pub fn main(init: std.process.Init) !void {
                 for (pstep.drv.outputs) |o| std.debug.print("  -> {s}\n", .{o.path});
             }
         } else {
-            const outs = zix.build.buildAll(a, &st.store, drv_path, build_dir, verbose, init.environ_map) catch |e| exitEvalError(e, st);
+            const outs = zix.build.buildAll(a, &st.store, drv_path, build_dir, verbose, init.environ_map, sandbox) catch |e| exitEvalError(e, st);
             for (outs) |o| std.debug.print("{s}\n", .{o});
         }
         return;

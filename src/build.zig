@@ -74,6 +74,7 @@ pub fn buildOne(
     build_dir: []const u8,
     verbose: bool,
     parent_env: ?*const std.process.Environ.Map,
+    sandbox: bool,
 ) BuildError!void {
     if (step.done) return;
     const drv = &step.drv;
@@ -94,7 +95,9 @@ pub fn buildOne(
         env.put("NIX_ATTRS_JSON_FILE", json_file) catch return error.OutOfMemory;
         env.put("NIX_ATTRS_SH_FILE", try std.fmt.allocPrint(alloc, "{s}/attrs.sh", .{build_dir})) catch return error.OutOfMemory;
     }
-    const defaults = [_][]const u8{ "PATH", "HOME", "TMPDIR", "TEMP", "LANG", "LC_ALL" };
+    // Sandboxed builds get a scrubbed environment: only PATH/HOME/TMPDIR
+    // fall back to the parent; everything else comes from the derivation.
+    const defaults = [_][]const u8{ "PATH", "HOME", "TMPDIR" };
     for (defaults) |d| {
         if (env.get(d) == null) {
             if (parent_env) |pe| {
@@ -122,6 +125,33 @@ pub fn buildOne(
     }
 
     var argv = std.array_list.Managed([]const u8).init(alloc);
+    if (sandbox) {
+        // Sandbox via bubblewrap: read-only root, isolated network/PID/mount
+        // namespaces, tmpfs for scratch dirs.  The store and build dirs stay
+        // writable (the build must write outputs into the store).
+        const bwrap_path = "bwrap";
+        try argv.append(bwrap_path);
+        try argv.append("--unshare-all");
+        try argv.append("--die-with-parent");
+        try argv.append("--ro-bind");
+        try argv.append("/");
+        try argv.append("/");
+        try argv.append("--proc");
+        try argv.append("/proc");
+        try argv.append("--tmpfs");
+        try argv.append("/tmp");
+        try argv.append("--tmpfs");
+        try argv.append("/run");
+        try argv.append("--dev");
+        try argv.append("/dev");
+        try argv.append("--bind");
+        try argv.append(st.store_dir);
+        try argv.append(st.store_dir);
+        try argv.append("--bind");
+        try argv.append(build_dir);
+        try argv.append(build_dir);
+        try argv.append("--");
+    }
     try argv.append(drv.builder);
     for (drv.args) |a| try argv.append(a);
 
@@ -194,11 +224,12 @@ pub fn buildAll(
     build_dir: []const u8,
     verbose: bool,
     parent_env: ?*const std.process.Environ.Map,
+    sandbox: bool,
 ) BuildError![]const []const u8 {
     const plan = try planBuild(alloc, st, drv_path);
     var out = std.array_list.Managed([]const u8).init(alloc);
     for (plan) |*step| {
-        try buildOne(alloc, st, step, build_dir, verbose, parent_env);
+        try buildOne(alloc, st, step, build_dir, verbose, parent_env, sandbox);
         for (step.drv.outputs) |o| try out.append(o.path);
     }
     return out.toOwnedSlice();

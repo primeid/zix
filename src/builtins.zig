@@ -2771,10 +2771,20 @@ const RNode = union(enum) {
     class: Class,
     seq: []const RNode,
     alt: []const RNode,
-    star: *const RNode,
-    plus: *const RNode,
-    opt: *const RNode,
-    group: *const RNode,
+    repeat: Repeat,
+    group: Group,
+};
+
+const Repeat = struct {
+    min: usize,
+    max: usize, // usize max = unbounded
+    lazy: bool,
+    child: *const RNode,
+};
+
+const Group = struct {
+    idx: usize,
+    inner: *const RNode,
 };
 
 const Class = struct {
@@ -2782,11 +2792,13 @@ const Class = struct {
     chars: []const u8, // literal chars
     ranges: []const [2]u8,
     any_char: bool, // '.' inside class
+    posix: []const []const u8, // posix class names, e.g. "alnum"
 };
 
 const Regex = struct {
     node: RNode,
     anchored: bool,
+    ngroups: usize,
 };
 
 fn regexParse(st: *Eval, pat: []const u8) EvalError!Regex {
@@ -2794,13 +2806,14 @@ fn regexParse(st: *Eval, pat: []const u8) EvalError!Regex {
     const anchored = p.i < p.s.len and p.s[p.i] == '^';
     if (anchored) p.i += 1;
     const node = try p.parseAlt(st);
-    return .{ .node = node, .anchored = anchored };
+    return .{ .node = node, .anchored = anchored, .ngroups = p.ngroups };
 }
 
 const RegexParser = struct {
     alloc: std.mem.Allocator,
     s: []const u8,
     i: usize = 0,
+    ngroups: usize = 0,
 
     fn parseAlt(self: *RegexParser, st: *Eval) EvalError!RNode {
         var alts = std.array_list.Managed(RNode).init(self.alloc);
@@ -2819,34 +2832,75 @@ const RegexParser = struct {
             const c = self.s[self.i];
             if (c == '|' or c == ')') break;
             var node = try self.parseAtom(st);
-            // postfix
+            // postfix quantifiers: * + ? {n,m}, each optionally lazy (*?)
             if (self.i < self.s.len) {
+                var min: ?usize = null;
+                var max: usize = std.math.maxInt(usize);
+                var lazy = false;
                 switch (self.s[self.i]) {
                     '*' => {
                         self.i += 1;
-                        const p = try self.alloc.create(RNode);
-                        p.* = node;
-                        node = .{ .star = p };
+                        min = 0;
                     },
                     '+' => {
                         self.i += 1;
-                        const p = try self.alloc.create(RNode);
-                        p.* = node;
-                        node = .{ .plus = p };
+                        min = 1;
                     },
                     '?' => {
                         self.i += 1;
-                        const p = try self.alloc.create(RNode);
-                        p.* = node;
-                        node = .{ .opt = p };
+                        min = 0;
+                        max = 1;
+                    },
+                    '{' => {
+                        const save = self.i;
+                        if (self.parseRepeatBounds()) |b| {
+                            min = b.min;
+                            max = b.max;
+                        } else {
+                            self.i = save; // not a repeat: literal '{'
+                        }
                     },
                     else => {},
+                }
+                if (min != null) {
+                    if (self.i < self.s.len and self.s[self.i] == '?') {
+                        self.i += 1;
+                        lazy = true;
+                    }
+                    const p = try self.alloc.create(RNode);
+                    p.* = node;
+                    node = .{ .repeat = .{ .min = min.?, .max = max, .lazy = lazy, .child = p } };
                 }
             }
             try seq.append(node);
         }
         if (seq.items.len == 1) return seq.items[0];
         return .{ .seq = seq.items };
+    }
+
+    /// Parse `{n}`, `{n,}`, `{n,m}`.  Returns null if it doesn't look like a
+    /// bound (in which case `{` is a literal).
+    fn parseRepeatBounds(self: *RegexParser) ?struct { min: usize, max: usize } {
+        var j = self.i + 1;
+        const digits_start = j;
+        while (j < self.s.len and self.s[j] >= '0' and self.s[j] <= '9') j += 1;
+        if (j == digits_start) return null;
+        const n1 = std.fmt.parseInt(usize, self.s[digits_start..j], 10) catch return null;
+        if (j < self.s.len and self.s[j] == '}') {
+            self.i = j + 1;
+            return .{ .min = n1, .max = n1 };
+        }
+        if (j >= self.s.len or self.s[j] != ',') return null;
+        j += 1;
+        const d2 = j;
+        while (j < self.s.len and self.s[j] >= '0' and self.s[j] <= '9') j += 1;
+        if (j < self.s.len and self.s[j] == '}') {
+            self.i = j + 1;
+            if (j == d2) return .{ .min = n1, .max = std.math.maxInt(usize) };
+            const n2 = std.fmt.parseInt(usize, self.s[d2..j], 10) catch return null;
+            return .{ .min = n1, .max = n2 };
+        }
+        return null;
     }
 
     fn parseAtom(self: *RegexParser, st: *Eval) EvalError!RNode {
@@ -2872,8 +2926,20 @@ const RegexParser = struct {
                 }
                 var chars = std.array_list.Managed(u8).init(self.alloc);
                 var ranges = std.array_list.Managed([2]u8).init(self.alloc);
+                var posix = std.array_list.Managed([]const u8).init(self.alloc);
                 var any_char = false;
                 while (self.i < self.s.len and self.s[self.i] != ']') {
+                    // POSIX class: [:name:]
+                    if (self.i + 2 < self.s.len and self.s[self.i] == '[' and self.s[self.i + 1] == ':') {
+                        const name_start = self.i + 2;
+                        var j = name_start;
+                        while (j + 1 < self.s.len and !(self.s[j] == ':' and self.s[j + 1] == ']')) j += 1;
+                        if (j + 1 < self.s.len) {
+                            try posix.append(self.s[name_start..j]);
+                            self.i = j + 2;
+                            continue;
+                        }
+                    }
                     var lo = self.s[self.i];
                     self.i += 1;
                     if (lo == '\\' and self.i < self.s.len) {
@@ -2898,15 +2964,17 @@ const RegexParser = struct {
                     }
                 }
                 if (self.i < self.s.len and self.s[self.i] == ']') self.i += 1;
-                return .{ .class = .{ .negated = negated, .chars = chars.items, .ranges = ranges.items, .any_char = any_char } };
+                return .{ .class = .{ .negated = negated, .chars = chars.items, .ranges = ranges.items, .any_char = any_char, .posix = posix.items } };
             },
             '(' => {
                 self.i += 1;
+                const idx = self.ngroups;
+                self.ngroups += 1;
                 const inner = try self.parseAlt(st);
                 if (self.i < self.s.len and self.s[self.i] == ')') self.i += 1;
                 const p = try self.alloc.create(RNode);
                 p.* = inner;
-                return .{ .group = p };
+                return .{ .group = .{ .idx = idx, .inner = p } };
             },
             '^' => {
                 self.i += 1;
@@ -2924,6 +2992,22 @@ const RegexParser = struct {
     }
 };
 
+fn posixClassMatch(name: []const u8, c: u8) bool {
+    if (std.mem.eql(u8, name, "alnum")) return std.ascii.isAlphanumeric(c);
+    if (std.mem.eql(u8, name, "alpha")) return std.ascii.isAlphabetic(c);
+    if (std.mem.eql(u8, name, "digit")) return std.ascii.isDigit(c);
+    if (std.mem.eql(u8, name, "space")) return std.ascii.isWhitespace(c);
+    if (std.mem.eql(u8, name, "blank")) return c == ' ' or c == '\t';
+    if (std.mem.eql(u8, name, "lower")) return std.ascii.isLower(c);
+    if (std.mem.eql(u8, name, "upper")) return std.ascii.isUpper(c);
+    if (std.mem.eql(u8, name, "punct")) return std.ascii.isPunctuation(c);
+    if (std.mem.eql(u8, name, "cntrl")) return std.ascii.isControl(c);
+    if (std.mem.eql(u8, name, "graph")) return c > 0x20 and c < 0x7f;
+    if (std.mem.eql(u8, name, "print")) return std.ascii.isPrint(c);
+    if (std.mem.eql(u8, name, "xdigit")) return std.ascii.isHex(c);
+    return false;
+}
+
 fn classMatch(cls: Class, c: u8) bool {
     var m = false;
     for (cls.chars) |ch| {
@@ -2940,144 +3024,201 @@ fn classMatch(cls: Class, c: u8) bool {
             }
         }
     }
-    if (!m and cls.any_char and c != '\n') m = true;
+    if (!m) {
+        for (cls.posix) |name| {
+            if (posixClassMatch(name, c)) {
+                m = true;
+                break;
+            }
+        }
+    }
+    if (!m and cls.any_char) m = true;
     return if (cls.negated) !m else m;
 }
 
-fn regexMatchAt(node: *const RNode, s: []const u8, pos: usize, captures: *std.array_list.Managed([]const u8)) EvalError!?usize {
+// --- Matcher --------------------------------------------------------------
+// Backtracking matcher that collects, for a node at `pos`, every possible end
+// position (in priority order: greedy = long first, lazy = short first) with a
+// snapshot of the capture groups.  The caller picks the first accepted end.
+
+const MatchEnd = struct {
+    pos: usize,
+    caps: []?[2]usize,
+};
+
+const MatchCtx = struct {
+    st: *Eval,
+    s: []const u8,
+    ends: *std.array_list.Managed(MatchEnd),
+};
+
+fn matchAddEnd(ctx: *MatchCtx, pos: usize, caps: []?[2]usize) EvalError!void {
+    const copy = try ctx.st.alloc.dupe(?[2]usize, caps);
+    try ctx.ends.append(.{ .pos = pos, .caps = copy });
+}
+
+fn matchNode(ctx: *MatchCtx, node: *const RNode, pos: usize, caps: []?[2]usize) EvalError!void {
+    if (ctx.ends.items.len > 50000) return;
     switch (node.*) {
         .ch => |c| {
-            if (c == 0) return pos; // dummy anchor marker
-            if (pos < s.len and s[pos] == c) return pos + 1;
-            return null;
+            if (c == 0) {
+                try matchAddEnd(ctx, pos, caps);
+                return;
+            }
+            if (pos < ctx.s.len and ctx.s[pos] == c) try matchAddEnd(ctx, pos + 1, caps);
         },
         .any => {
-            if (pos < s.len and s[pos] != '\n') return pos + 1;
-            return null;
+            // Nix's regex (`std::regex`) lets `.` match any character.
+            if (pos < ctx.s.len) try matchAddEnd(ctx, pos + 1, caps);
         },
         .class => |cls| {
-            if (pos < s.len and classMatch(cls, s[pos])) return pos + 1;
-            return null;
+            if (pos < ctx.s.len and classMatch(cls, ctx.s[pos])) try matchAddEnd(ctx, pos + 1, caps);
         },
-        .seq => |seq| {
-            var p = pos;
-            for (seq) |*item| {
-                const np = (try regexMatchAt(item, s, p, captures)) orelse return null;
-                p = np;
-            }
-            return p;
-        },
+        .seq => |seq| try matchSeq(ctx, seq, 0, pos, caps),
         .alt => |alts| {
             for (alts) |*item| {
-                const save_len = captures.items.len;
-                if (try regexMatchAt(item, s, pos, captures)) |np| return np;
-                captures.shrinkRetainingCapacity(save_len);
+                const before = ctx.ends.items.len;
+                try matchNode(ctx, item, pos, caps);
+                const produced = try ctx.st.alloc.dupe(MatchEnd, ctx.ends.items[before..]);
+                ctx.ends.shrinkRetainingCapacity(before);
+                for (produced) |e| try ctx.ends.append(e);
             }
-            return null;
         },
-        .group => |inner| {
-            const gstart = captures.items.len;
-            try captures.append(s[pos..pos]);
-            const np = (try regexMatchAt(inner, s, pos, captures)) orelse return null;
-            captures.items[gstart] = s[pos..np];
-            return np;
-        },
-        .star => |inner| {
-            var p = pos;
-            while (true) {
-                const save_len = captures.items.len;
-                const np = (try regexMatchAt(inner, s, p, captures)) orelse break;
-                _ = save_len;
-                if (np == p) break;
-                p = np;
+        .group => |g| {
+            const before = ctx.ends.items.len;
+            try matchNode(ctx, g.inner, pos, caps);
+            const produced = try ctx.st.alloc.dupe(MatchEnd, ctx.ends.items[before..]);
+            ctx.ends.shrinkRetainingCapacity(before);
+            for (produced) |e| {
+                const caps2 = try ctx.st.alloc.dupe(?[2]usize, e.caps);
+                caps2[g.idx] = .{ pos, e.pos };
+                try ctx.ends.append(.{ .pos = e.pos, .caps = caps2 });
             }
-            return p;
         },
-        .plus => |inner| {
-            const save = captures.items.len;
-            _ = save;
-            const np = (try regexMatchAt(inner, s, pos, captures)) orelse return null;
-            var p = np;
-            while (true) {
-                const np2 = (try regexMatchAt(inner, s, p, captures)) orelse break;
-                if (np2 == p) break;
-                p = np2;
-            }
-            return p;
-        },
-        .opt => |inner| {
-            const save_len = captures.items.len;
-            if (try regexMatchAt(inner, s, pos, captures)) |np| return np;
-            captures.shrinkRetainingCapacity(save_len);
-            return pos;
-        },
+        .repeat => |r| try matchRepeat(ctx, r, pos, caps),
     }
 }
 
-fn regexMatch(st: *Eval, pat: []const u8, s: []const u8) EvalError!Value {
+fn matchSeq(ctx: *MatchCtx, seq: []const RNode, i: usize, pos: usize, caps: []?[2]usize) EvalError!void {
+    if (i >= seq.len) {
+        try matchAddEnd(ctx, pos, caps);
+        return;
+    }
+    const before = ctx.ends.items.len;
+    try matchNode(ctx, &seq[i], pos, caps);
+    // Copy the produced ends: the buffer reallocates as we recurse.
+    const produced = try ctx.st.alloc.dupe(MatchEnd, ctx.ends.items[before..]);
+    ctx.ends.shrinkRetainingCapacity(before);
+    for (produced) |e| {
+        try matchSeq(ctx, seq, i + 1, e.pos, e.caps);
+    }
+}
 
+/// Match a repeat `{min,max}`: try k iterations for each k in range.
+/// Greedy tries the most iterations first; lazy tries the fewest first.
+fn matchRepeat(ctx: *MatchCtx, r: Repeat, pos: usize, caps: []?[2]usize) EvalError!void {
+    var levels = std.array_list.Managed(std.array_list.Managed(MatchEnd)).init(ctx.st.alloc);
+    var level0 = std.array_list.Managed(MatchEnd).init(ctx.st.alloc);
+    try level0.append(.{ .pos = pos, .caps = caps });
+    try levels.append(level0);
+    var k: usize = 0;
+    while (k < r.max) {
+        const prev = levels.items[k];
+        if (prev.items.len == 0) break;
+        var next = std.array_list.Managed(MatchEnd).init(ctx.st.alloc);
+        for (prev.items) |e| {
+            const before = ctx.ends.items.len;
+            try matchNode(ctx, r.child, e.pos, e.caps);
+            const produced = try ctx.st.alloc.dupe(MatchEnd, ctx.ends.items[before..]);
+            ctx.ends.shrinkRetainingCapacity(before);
+            for (produced) |p2| try next.append(p2);
+        }
+        try levels.append(next);
+        k += 1;
+    }
+    if (r.lazy) {
+        var kk: usize = r.min;
+        while (kk < levels.items.len) : (kk += 1) {
+            for (levels.items[kk].items) |e| try ctx.ends.append(e);
+        }
+    } else {
+        var kk = levels.items.len;
+        while (kk > r.min) {
+            kk -= 1;
+            for (levels.items[kk].items) |e| try ctx.ends.append(e);
+        }
+    }
+}
+
+/// Search: try every start position, run the matcher, pick the first end.
+/// `full` = the match must consume the whole string (builtins.match).
+fn regexFindMatch(st: *Eval, re: *const Regex, s: []const u8, start: usize, full: bool) EvalError!?struct { mstart: usize, end: usize, caps: []?[2]usize } {
+    var search = start;
+    while (search <= s.len) {
+        var ends = std.array_list.Managed(MatchEnd).init(st.alloc);
+        var ctx = MatchCtx{ .st = st, .s = s, .ends = &ends };
+        const caps = try st.alloc.alloc(?[2]usize, re.ngroups);
+        @memset(caps, null);
+        try matchNode(&ctx, &re.node, search, caps);
+        for (ends.items) |e| {
+            if (!full or e.pos == s.len) {
+                return .{ .mstart = search, .end = e.pos, .caps = e.caps };
+            }
+        }
+        search += 1;
+    }
+    return null;
+}
+
+fn regexMatch(st: *Eval, pat: []const u8, s: []const u8) EvalError!Value {
     const re = try regexParse(st, pat);
-    // full-match semantics (anchored)
-    var captures = std.array_list.Managed([]const u8).init(st.alloc);
-    const end = (try regexMatchAt(&re.node, s, 0, &captures)) orelse return .null_;
-    if (end != s.len) return .null_;
-    const out = try st.alloc.alloc(*Value, captures.items.len);
-    for (captures.items, 0..) |cap, i| {
+    const m = (try regexFindMatch(st, &re, s, 0, true)) orelse return .null_;
+    const out = try st.alloc.alloc(*Value, re.ngroups);
+    for (0..re.ngroups) |i| {
         const v = try st.alloc.create(Value);
-        v.* = st.mkString(cap, &.{});
+        if (m.caps[i]) |span| {
+            v.* = st.mkString(s[span[0]..span[1]], &.{});
+        } else {
+            v.* = .null_;
+        }
         out[i] = v;
     }
     return .{ .list = out };
 }
 
 fn regexSplit(st: *Eval, pat: []const u8, s: []const u8) EvalError!Value {
-
     const re = try regexParse(st, pat);
     var out = std.array_list.Managed(*Value).init(st.alloc);
     var pos: usize = 0;
     while (pos < s.len) {
-        // find next match starting at or after pos
-        var mstart: ?usize = null;
-        var mend: usize = 0;
-        var mcap = std.array_list.Managed([]const u8).init(st.alloc);
-        var search = pos;
-        while (search <= s.len) {
-            var captures = std.array_list.Managed([]const u8).init(st.alloc);
-            if (try regexMatchAt(&re.node, s, search, &captures)) |end| {
-                mstart = search;
-                mend = end;
-                mcap = captures;
-                break;
-            }
-            search += 1;
+        const m = (try regexFindMatch(st, &re, s, pos, false)) orelse break;
+        if (m.end == m.mstart) {
+            // empty match: advance one char to make progress
+            pos += 1;
+            continue;
         }
-        if (mstart == null) break;
-        // text before the match
         const v = try st.alloc.create(Value);
-        v.* = st.mkString(s[pos..mstart.?], &.{});
+        v.* = st.mkString(s[pos..m.mstart], &.{});
         try out.append(v);
-        // the match itself: string, or list of captures
-        if (mcap.items.len > 0) {
-            const caps = try st.alloc.alloc(*Value, mcap.items.len);
-            for (mcap.items, 0..) |cap, i| {
-                const cv = try st.alloc.create(Value);
-                cv.* = st.mkString(cap, &.{});
-                caps[i] = cv;
+        const caps = try st.alloc.alloc(*Value, re.ngroups);
+        for (0..re.ngroups) |i| {
+            const cv = try st.alloc.create(Value);
+            if (m.caps[i]) |span| {
+                cv.* = st.mkString(s[span[0]..span[1]], &.{});
+            } else {
+                cv.* = .null_;
             }
-            const mv = try st.alloc.create(Value);
-            mv.* = .{ .list = caps };
-            try out.append(mv);
-        } else {
-            // No explicit capture groups: Nix yields an empty list for the
-            // separator position (captured groups would appear here).
-            const mv = try st.alloc.create(Value);
-            mv.* = .{ .list = &.{} };
-            try out.append(mv);
+            caps[i] = cv;
         }
-        pos = mend;
+        const mv = try st.alloc.create(Value);
+        mv.* = .{ .list = caps };
+        try out.append(mv);
+        pos = m.end;
     }
-    const last = try st.alloc.create(Value);
-    last.* = st.mkString(s[pos..], &.{});
-    try out.append(last);
+    if (pos < s.len) {
+        const last = try st.alloc.create(Value);
+        last.* = st.mkString(s[pos..], &.{});
+        try out.append(last);
+    }
     return .{ .list = out.items };
 }

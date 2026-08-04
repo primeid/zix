@@ -200,7 +200,7 @@ test "eval: positions (__curPos, unsafeGetAttrPos)" {
     const st = try newState(a);
     defer st.deinit();
     st.cur_file = "/test.nix";
-    try expectEval(a, "builtins.unsafeGetAttrPos \"a\" { a = 1; }", "{ column = 33; file = \"<test>\"; line = 1; }");
+    try expectEval(a, "builtins.unsafeGetAttrPos \"a\" { a = 1; }", "{ column = 33; file = <test>; line = 1; }");
     try expectEval(a, "builtins.unsafeGetAttrPos \"missing\" { a = 1; }", "null");
     try expectEval(a, "builtins.typeOf (builtins.unsafeGetAttrPos \"a\" { a = 1; })", "set");
 }

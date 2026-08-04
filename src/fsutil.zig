@@ -1,6 +1,7 @@
 //! Thin filesystem helpers over Zig 0.16's `std.Io` API.
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 /// The default (single-threaded, debug) Io instance.
 pub const io: std.Io = std.Options.debug_io;
@@ -21,13 +22,15 @@ pub fn statPath(path: []const u8) !Stat {
     } else |_| {}
     const st = try std.Io.Dir.cwd().statFile(io, path, .{});
     var executable = false;
-    _ = std.Io.Dir.cwd().access(io, path, .{ .execute = true }) catch |e| switch (e) {
-        error.AccessDenied => {},
-        else => {},
-    };
-    if (std.Io.Dir.cwd().access(io, path, .{ .execute = true })) |_| {
-        executable = true;
-    } else |_| {}
+    if (builtin.os.tag != .windows) {
+        _ = std.Io.Dir.cwd().access(io, path, .{ .execute = true }) catch |e| switch (e) {
+            error.AccessDenied => {},
+            else => {},
+        };
+        if (std.Io.Dir.cwd().access(io, path, .{ .execute = true })) |_| {
+            executable = true;
+        } else |_| {}
+    }
     return .{
         .kind = switch (st.kind) {
             .file => .file,

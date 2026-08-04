@@ -38,6 +38,7 @@ pub const Builtin = struct {
 pub const Lambda = struct {
     params: ast.Lambda,
     env: *Env,
+    pos: ast.Pos = .{},
 };
 
 pub const Thunk = struct {
@@ -65,6 +66,8 @@ pub const Value = union(enum) {
 pub const Item = struct {
     name: []const u8,
     value: *Value,
+    /// source position of the attribute binding (for builtins.unsafeGetAttrPos)
+    pos: ast.Pos = .{},
 };
 
 /// Attribute set with items sorted by name.  `rec_env` is the frame used

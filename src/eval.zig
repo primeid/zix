@@ -51,6 +51,8 @@ pub const EvalState = struct {
     err_kind: enum { none, assert, thrown, other } = .none,
     /// nested evaluation depth (guards against stack overflow)
     call_depth: usize = 0,
+    /// position of the expression currently being evaluated (for errors)
+    cur_pos: ast.Pos = .{},
     /// current file being evaluated (for __curPos / import paths)
     cur_file: []const u8 = "",
     /// import cache: path → parsed expr
@@ -187,7 +189,8 @@ pub const EvalState = struct {
         if (self.call_depth > 50000) {
             return self.userError("stack overflow (possible infinite recursion)", .{});
         }
-        switch (expr.*) {
+        self.cur_pos = expr.pos;
+        switch (expr.kind) {
             .int => |i| return .{ .int = i },
             .float => |f| return .{ .float = f },
             .path => |p| return .{ .path = .{ .p = p } },
@@ -195,11 +198,13 @@ pub const EvalState = struct {
                 // __curPos: null when no file position is available
                 // (command-line expressions), like Nix.
                 if (self.cur_file.len == 0) return .null_;
-                const items = try self.alloc.alloc(Item, 2);
-                items[0] = .{ .name = "file", .value = try self.alloc.create(Value) };
-                items[0].value.* = self.mkString(self.cur_file, &.{});
-                items[1] = .{ .name = "line", .value = try self.alloc.create(Value) };
-                items[1].value.* = .{ .int = @intCast(pos) };
+                const items = try self.alloc.alloc(Item, 3);
+                items[0] = .{ .name = "column", .value = try self.alloc.create(Value) };
+                items[0].value.* = .{ .int = self.cur_pos.col };
+                items[1] = .{ .name = "file", .value = try self.alloc.create(Value) };
+                items[1].value.* = self.mkString(self.cur_pos.file, &.{});
+                items[2] = .{ .name = "line", .value = try self.alloc.create(Value) };
+                items[2].value.* = .{ .int = self.cur_pos.line };
                 return self.mkAttrs(items);
             },
             .import_path => |name| {
@@ -391,7 +396,7 @@ pub const EvalState = struct {
             },
             .lambda => |lam| {
                 const l = try self.alloc.create(value.Lambda);
-                l.* = .{ .params = lam, .env = env };
+                l.* = .{ .params = lam, .env = env, .pos = lam.pos };
                 return .{ .lambda = l };
             },
             .list => |elems| {
@@ -531,10 +536,12 @@ pub const EvalState = struct {
             value_expr: ?*ast.Expr,
             inherit_from: ?*ast.Expr,
             rest: std.array_list.Managed(ast.AttrBind),
+            pos: ast.Pos = .{},
         };
         var groups = std.array_list.Managed(Group).init(self.alloc);
         var names = std.array_list.Managed([]const u8).init(self.alloc);
         for (binds) |bind| {
+            const gpos = bind.pos;
             var name: []const u8 = undefined;
             var rest_binds: []const ast.AttrBind = &.{};
             if (bind.path.len == 1) {
@@ -579,6 +586,7 @@ pub const EvalState = struct {
                     .value_expr = null,
                     .inherit_from = null,
                     .rest = std.array_list.Managed(ast.AttrBind).init(self.alloc),
+                    .pos = gpos,
                 };
                 if (rest_binds.len > 0) {
                     try g.rest.append(rest_binds[0]);
@@ -594,7 +602,7 @@ pub const EvalState = struct {
         // 2. Build items: each group → one item whose value is a thunk.
         const items = try self.alloc.alloc(Item, groups.items.len);
         for (groups.items, 0..) |g, i| {
-            items[i] = .{ .name = g.name, .value = try self.alloc.create(Value) };
+            items[i] = .{ .name = g.name, .value = try self.alloc.create(Value), .pos = g.pos };
         }
         var rec_env: ?*Env = null;
         if (recursive) {
@@ -610,14 +618,14 @@ pub const EvalState = struct {
             const item_env = rec_env orelse env;
             const e = try self.alloc.create(ast.Expr);
             if (g.rest.items.len > 0) {
-                e.* = .{ .attrset = .{ .binds = g.rest.items, .recursive = recursive } };
+                e.* = .{ .pos = g.pos, .kind = .{ .attrset = .{ .binds = g.rest.items, .recursive = recursive } } };
                 items[i].value.* = try self.mkThunk(e, item_env, pos);
             } else if (g.inherit_from) |from| {
                 // inherit (x) name → select
                 const sel = try self.alloc.create(ast.Expr);
                 const sel_attrs = try self.alloc.alloc(ast.AttrElem, 1);
                 sel_attrs[0] = .{ .static = g.name };
-                sel.* = .{ .select = .{ .base = from, .attrs = sel_attrs, .default = null } };
+                sel.* = .{ .pos = g.pos, .kind = .{ .select = .{ .base = from, .attrs = sel_attrs, .default = null } } };
                 items[i].value.* = try self.mkThunk(sel, env, pos);
             } else {
                 items[i].value.* = try self.mkThunk(g.value_expr.?, item_env, pos);
@@ -913,6 +921,7 @@ pub const EvalState = struct {
         const dirname = std.fs.path.dirname(file) orelse "";
         const base_dir = if (dirname.len > 0) dirname else ".";
         var p = parser.Parser.init(self.alloc, toks, base_dir, self.home_dir);
+        p.file = file;
         return p.parse() catch |e| {
             return self.userError("parse error in '{s}': {s}", .{ file, @errorName(e) });
         };

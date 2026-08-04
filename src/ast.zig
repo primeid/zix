@@ -3,7 +3,13 @@
 
 const std = @import("std");
 
-pub const Expr = union(enum) {
+pub const Pos = struct {
+    file: []const u8 = "",
+    line: u32 = 0,
+    col: u32 = 0,
+};
+
+pub const Kind = union(enum) {
     int: i64,
     float: f64,
     str: Str,
@@ -83,6 +89,7 @@ pub const AttrBind = struct {
     value: *Expr,
     /// `inherit (x) a b`: expression producing the attrset to inherit from.
     inherit_from: ?*Expr,
+    pos: Pos = .{},
 };
 
 pub const AttrSet = struct {
@@ -119,4 +126,11 @@ pub const Lambda = struct {
     /// `@name` binding receiving the whole argument attrset
     arg_name: ?[]const u8,
     body: *Expr,
+    pos: Pos = .{},
+};
+
+/// An expression node with its source position.
+pub const Expr = struct {
+    pos: Pos = .{},
+    kind: Kind,
 };

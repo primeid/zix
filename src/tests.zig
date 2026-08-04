@@ -193,6 +193,18 @@ test "eval: store paths match real Nix 2.34.7" {
     );
 }
 
+test "eval: positions (__curPos, unsafeGetAttrPos)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const st = try newState(a);
+    defer st.deinit();
+    st.cur_file = "/test.nix";
+    try expectEval(a, "builtins.unsafeGetAttrPos \"a\" { a = 1; }", "{ column = 33; file = \"<test>\"; line = 1; }");
+    try expectEval(a, "builtins.unsafeGetAttrPos \"missing\" { a = 1; }", "null");
+    try expectEval(a, "builtins.typeOf (builtins.unsafeGetAttrPos \"a\" { a = 1; })", "set");
+}
+
 test "eval: strict interpolation (Nix 2.3x)" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

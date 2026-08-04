@@ -26,6 +26,7 @@ pub const Parser = struct {
     i: usize = 0,
     base_dir: []const u8,
     home_dir: []const u8,
+    file: []const u8 = "",
 
     pub fn init(alloc: std.mem.Allocator, toks: []const Token, base_dir: []const u8, home_dir: []const u8) Parser {
         return .{ .alloc = alloc, .toks = toks, .base_dir = base_dir, .home_dir = home_dir };
@@ -71,9 +72,10 @@ pub const Parser = struct {
         return e;
     }
 
-    fn allocExpr(self: *Parser, e: ast.Expr) ParseError!*ast.Expr {
+    fn allocExpr(self: *Parser, e: ast.Kind) ParseError!*ast.Expr {
         const p = try self.alloc.create(ast.Expr);
-        p.* = e;
+        const t = self.peek();
+        p.* = .{ .pos = .{ .file = self.file, .line = @intCast(t.line), .col = @intCast(t.col) }, .kind = e };
         return p;
     }
 
@@ -83,10 +85,11 @@ pub const Parser = struct {
         if (t.kind == .ident and !lexer.isKeyword(t.text) and !std.mem.eql(u8, t.text, "or")) {
             const next = self.peekAt(1);
             if (next.kind == .colon) {
+                const lam_pos = t;
                 _ = self.advance(); // ID
                 _ = try self.expect(.colon);
                 const body = try self.parseExpr();
-                return self.allocExpr(.{ .lambda = .{ .arg = t.text, .formals = null, .arg_name = null, .body = body } });
+                return self.allocExpr(.{ .lambda = .{ .arg = t.text, .formals = null, .arg_name = null, .body = body, .pos = .{ .file = self.file, .line = @intCast(lam_pos.line), .col = @intCast(lam_pos.col) } } });
             }
             if (next.kind == .at) {
                 // ID '@' formals ':' expr
@@ -96,10 +99,11 @@ pub const Parser = struct {
                 const formals = try self.parseFormals();
                 _ = try self.expect(.colon);
                 const body = try self.parseExpr();
-                return self.allocExpr(.{ .lambda = .{ .arg = null, .formals = formals, .arg_name = arg_name, .body = body } });
+                return self.allocExpr(.{ .lambda = .{ .arg = null, .formals = formals, .arg_name = arg_name, .body = body, .pos = .{ .file = self.file, .line = @intCast(t.line), .col = @intCast(t.col) } } });
             }
         }
         if (t.kind == .lbrace and self.isBraceFormals()) {
+            const lam_pos = t;
             const formals = try self.parseFormals();
             var arg_name: ?[]const u8 = null;
             if (self.peek().kind == .at) {
@@ -111,7 +115,7 @@ pub const Parser = struct {
             }
             _ = try self.expect(.colon);
             const body = try self.parseExpr();
-            return self.allocExpr(.{ .lambda = .{ .arg = null, .formals = formals, .arg_name = arg_name, .body = body } });
+            return self.allocExpr(.{ .lambda = .{ .arg = null, .formals = formals, .arg_name = arg_name, .body = body, .pos = .{ .file = self.file, .line = @intCast(lam_pos.line), .col = @intCast(lam_pos.col) } } });
         }
 
         if (self.isIdent("assert")) {
@@ -446,6 +450,7 @@ pub const Parser = struct {
             .toks = ts,
             .base_dir = self.base_dir,
             .home_dir = self.home_dir,
+            .file = self.file,
         };
         return sub.parse();
     }
@@ -660,6 +665,7 @@ pub const Parser = struct {
             }
             if (is_let and self.isIdent("in")) break;
             if (self.isIdent("inherit")) {
+                const inherit_pos = self.peek();
                 _ = self.advance();
                 var from: ?*ast.Expr = null;
                 if (self.peek().kind == .lparen) {
@@ -689,11 +695,13 @@ pub const Parser = struct {
                         .path = path,
                         .value = try self.allocExpr(.{ .var_ref = name }),
                         .inherit_from = from,
+                        .pos = .{ .file = self.file, .line = @intCast(inherit_pos.line), .col = @intCast(inherit_pos.col) },
                     });
                 }
                 continue;
             }
             // attrpath '=' expr ';'
+            const bind_pos = self.peek();
             const path = try self.parseAttrPath();
             if (!allow_dynamic_let) {
                 for (path) |el| {
@@ -703,7 +711,7 @@ pub const Parser = struct {
             _ = try self.expect(.equals);
             const value = try self.parseExpr();
             _ = try self.expect(.semicolon);
-            try binds.append(.{ .path = path, .value = value, .inherit_from = null });
+            try binds.append(.{ .path = path, .value = value, .inherit_from = null, .pos = .{ .file = self.file, .line = @intCast(bind_pos.line), .col = @intCast(bind_pos.col) } });
         }
         return binds.items;
     }
@@ -797,7 +805,7 @@ test "parser basics" {
     const toks = try lx.lexAll();
     var p = Parser.init(a, toks, "/home/user", "/home/user");
     const e = try p.parse();
-    try std.testing.expect(e.* == .let_rec);
+    try std.testing.expect(e.kind == .let_rec);
 }
 
 test "parser lambda and attrsets" {
@@ -811,8 +819,8 @@ test "parser lambda and attrsets" {
     const toks = try lx.lexAll();
     var p = Parser.init(a, toks, "/home/user", "/home/user");
     const e = try p.parse();
-    try std.testing.expect(e.* == .lambda);
-    const lam = e.lambda;
+    try std.testing.expect(e.kind == .lambda);
+    const lam = e.kind.lambda;
     try std.testing.expect(lam.formals != null);
     try std.testing.expectEqualStrings("args", lam.arg_name.?);
 }
@@ -829,9 +837,9 @@ test "parser stripIndentation" {
     try std.testing.expectEqual(TokenKind.indented, toks[0].kind);
     var p = Parser.init(a, toks, "/home/user", "/home/user");
     const e = try p.parse();
-    try std.testing.expect(e.* == .str);
-    try std.testing.expectEqual(@as(usize, 1), e.str.parts.len);
-    try std.testing.expectEqualStrings("hello\nworld\n", e.str.parts[0].lit);
+    try std.testing.expect(e.kind == .str);
+    try std.testing.expectEqual(@as(usize, 1), e.kind.str.parts.len);
+    try std.testing.expectEqualStrings("hello\nworld\n", e.kind.str.parts[0].lit);
 }
 
 test "parser precedence" {
@@ -845,16 +853,16 @@ test "parser precedence" {
     const toks = try lx.lexAll();
     var p = Parser.init(a, toks, "/home/user", "/home/user");
     const e = try p.parse();
-    try std.testing.expect(e.* == .not_);
-    try std.testing.expect(e.not_.* == .concat);
+    try std.testing.expect(e.kind == .not_);
+    try std.testing.expect(e.kind.not_.kind == .concat);
 
     // `-` binds tighter than `*`:  -a * b  ==  (-a) * b
     lx = lexer.Lexer.init(a, "-a * b");
     const toks2 = try lx.lexAll();
     p = Parser.init(a, toks2, "/home/user", "/home/user");
     const e2 = try p.parse();
-    try std.testing.expect(e2.* == .call_builtin); // mul
-    const mul = e2.call_builtin;
+    try std.testing.expect(e2.kind == .call_builtin); // mul
+    const mul = e2.kind.call_builtin;
     try std.testing.expectEqualStrings("mul", mul.name);
-    try std.testing.expect(mul.args[0].* == .call_builtin); // sub 0 a
+    try std.testing.expect(mul.args[0].kind == .call_builtin); // sub 0 a
 }

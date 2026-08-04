@@ -395,6 +395,7 @@ pub const Lexer = struct {
     /// Returns the float value if a full match was consumed.
     fn matchFloatFrom(self: *Lexer, start: usize) ?f64 {
         const save = self.pos;
+        const save_col = self.col;
         // mantissa: ([1-9][0-9]*\.[0-9]*)|(0?\.[0-9]+) — we already consumed
         // the integer part; Nix requires the dot in the mantissa.
         if (self.peek(0) != '.') return null;
@@ -426,10 +427,12 @@ pub const Lexer = struct {
         // approximated; re-validate against the exact regex.
         if (!validFloatRegex(text)) {
             self.pos = save;
+            self.col = save_col;
             return null;
         }
         const v = std.fmt.parseFloat(f64, text) catch {
             self.pos = save;
+            self.col = save_col;
             return null;
         };
         return v;
@@ -464,6 +467,7 @@ pub const Lexer = struct {
         while (i < self.src.len and isUriBodyChar(self.src[i])) i += 1;
         const text = self.src[start..i];
         self.pos = i;
+        self.col += i - start;
         return text;
     }
 
@@ -484,6 +488,7 @@ pub const Lexer = struct {
         if (i >= self.src.len or self.src[i] != '>') return null;
         const inner = self.src[start + 1 .. i];
         self.pos = i + 1;
+        self.col += (i + 1) - start;
         return inner;
     }
 
@@ -494,6 +499,8 @@ pub const Lexer = struct {
         const line = self.line;
         const col = self.col;
         const start = self.pos;
+        const save_col = self.col;
+        const save_line = self.line;
         if (home) {
             if (self.peek(0) != '~') return null;
             if (self.peek(1) != '/') return null;
@@ -532,6 +539,8 @@ pub const Lexer = struct {
         }
         if (segs == 0) {
             self.pos = start;
+            self.col = save_col;
+            self.line = save_line;
             return null;
         }
         // optional trailing slash

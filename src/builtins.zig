@@ -198,6 +198,7 @@ pub fn makeBuiltins(st: *Eval) !Init {
     try B.add(&items, st, "hashFile", 2, primHashFile);
     try B.add(&items, st, "storePath", 1, primStorePath);
     try B.add(&items, st, "getEnv", 1, primGetEnv);
+    try B.add(&items, st, "unsafeGetAttrPos", 2, primUnsafeGetAttrPos);
     try B.add(&items, st, "derivationStrict", 1, primDerivationStrict);
     try B.add(&items, st, "placeholder", 1, primPlaceholder);
     try B.add(&items, st, "import", 1, primImport);
@@ -822,6 +823,34 @@ fn primGetAttr(st: *Eval, args: []const *Value, pos: usize) EvalError!Value {
         return st.userError("attribute '{s}' missing", .{name});
     };
     return item.*;
+}
+
+fn primUnsafeGetAttrPos(st: *Eval, args: []const *Value, pos: usize) EvalError!Value {
+    _ = pos;
+    const name = try forceStringNoCtx(st, args[0], "while evaluating the first argument to builtins.unsafeGetAttrPos");
+    var a = args[1].*;
+    try st.force(&a);
+    if (a != .attrs) return st.userError("'unsafeGetAttrPos' called on {s}, expected a set", .{eval.EvalState.showType(a)});
+    var item: ?value.Item = null;
+    for (a.attrs.items) |it| {
+        if (std.mem.eql(u8, it.name, name)) {
+            item = it;
+            break;
+        }
+    }
+    const it = item orelse return .null_;
+    if (it.pos.line == 0) return .null_;
+    const items = try st.alloc.alloc(value.Item, 3);
+    const col_v = try st.alloc.create(Value);
+    col_v.* = .{ .int = it.pos.col };
+    const file_v = try st.alloc.create(Value);
+    file_v.* = st.mkString(it.pos.file, &.{});
+    const line_v = try st.alloc.create(Value);
+    line_v.* = .{ .int = it.pos.line };
+    items[0] = .{ .name = "column", .value = col_v };
+    items[1] = .{ .name = "file", .value = file_v };
+    items[2] = .{ .name = "line", .value = line_v };
+    return st.mkAttrs(items);
 }
 
 fn primRemoveAttrs(st: *Eval, args: []const *Value, pos: usize) EvalError!Value {

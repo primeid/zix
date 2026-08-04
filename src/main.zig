@@ -105,6 +105,9 @@ pub fn main(init: std.process.Init) !void {
             printValue(ctx.st, &result, ctx.output, 0, ctx.raw) catch |e| {
                 if (ctx.st.err_msg.len > 0) {
                     std.debug.print("zix: error printing value: {s}\n", .{ctx.st.err_msg});
+                    if (ctx.st.cur_pos.line > 0) {
+                        std.debug.print("       at «{s}»:{d}:{d}\n", .{ ctx.st.cur_pos.file, ctx.st.cur_pos.line, ctx.st.cur_pos.col });
+                    }
                 } else {
                     std.debug.print("zix: error printing value: {s}\n", .{@errorName(e)});
                 }
@@ -127,6 +130,7 @@ pub fn main(init: std.process.Init) !void {
         t.join();
     } else {
         const parsed = st.parseFile(target_str) catch |e| exitEvalError(e, st);
+        st.cur_file = target_str;
         const t = try std.Thread.spawn(.{ .stack_size = 1 << 30 }, run_eval, .{ RunCtx{ .st = st, .parsed = parsed, .output = &output, .raw = raw } });
         t.join();
     }
@@ -138,6 +142,9 @@ pub fn main(init: std.process.Init) !void {
 fn exitEvalError(e: anyerror, st: *eval.EvalState) noreturn {
     if (st.err_msg.len > 0) {
         std.debug.print("zix: error: {s}\n", .{st.err_msg});
+        if (st.cur_pos.line > 0) {
+            std.debug.print("       at «{s}»:{d}:{d}\n", .{ st.cur_pos.file, st.cur_pos.line, st.cur_pos.col });
+        }
     } else {
         std.debug.print("zix: error: {s}\n", .{@errorName(e)});
     }
@@ -293,7 +300,15 @@ fn printValueSeen(
             }
             try w.appendSlice("; }");
         },
-        .lambda => try w.appendSlice("«lambda»"),
+        .lambda => |l| {
+            try w.appendSlice("«lambda @ «");
+            if (std.mem.endsWith(u8, l.pos.file, "<command-line>")) {
+                try w.appendSlice("string");
+            } else {
+                try w.appendSlice(l.pos.file);
+            }
+            try w.appendSlice(try std.fmt.allocPrint(st.alloc, "»:{d}:{d}»", .{ l.pos.line, l.pos.col }));
+        },
         .builtin => |b| {
             try w.appendSlice("«primop ");
             try w.appendSlice(b.name);

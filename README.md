@@ -113,8 +113,6 @@ Conscious and documented differences:
   `take`, `drop`, `reverseList`, `currentSystem` — compatibility-friendly extensions.
 - **`|>` / `<|`** (pipe operators) are enabled by default; Nix requires
   `--extra-experimental-features pipe-operators`.
-- **Lambda printing** shows `«lambda»` without position (`«lambda @ «string»:1:3»`
-  in Nix) — position tracking is on the roadmap.
 - **Error messages** behave the same (the same cases fail), but the text is
   often shorter than Nix's.
 - `nixVersion` reports `2.34.7` (for compatibility), `langVersion` = 6.

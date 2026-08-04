@@ -270,11 +270,10 @@ test "nar hash matches nix hash path (ground truth from Nix 2.34)" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
-    const tmp_root = "/tmp/zix-test-nar";
     var ctr: usize = 0;
     const ts = std.Io.Clock.now(.real, fsutil.io);
     const stamp: i64 = @intCast(@divTrunc(ts.nanoseconds, 1_000_000));
-    const dir = try std.fmt.allocPrint(alloc, "{s}-{d}-{d}", .{ tmp_root, stamp, @atomicRmw(usize, &ctr, .Add, 1, .seq_cst) });
+    const dir = try std.fmt.allocPrint(alloc, "zix-test-nar-{d}-{d}", .{ stamp, @atomicRmw(usize, &ctr, .Add, 1, .seq_cst) });
     defer alloc.free(dir);
     defer std.Io.Dir.cwd().deleteTree(fsutil.io, dir) catch {};
     try fsutil.makePath(dir);

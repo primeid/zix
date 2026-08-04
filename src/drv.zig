@@ -174,7 +174,16 @@ pub fn hashDerivationModulo(
     // Fixed-output derivation → fixed hash per output.
     var fixed = false;
     for (drv.outputs) |o| {
-        if (o.hash_algo.len > 0) {
+        // A floating content-addressed output records the all-zero hash — it
+        // is not a fixed-output derivation.
+        var all_zero = o.hash.len > 0;
+        for (o.hash) |c| {
+            if (c != '0') {
+                all_zero = false;
+                break;
+            }
+        }
+        if (o.hash_algo.len > 0 and o.hash.len > 0 and !all_zero) {
             fixed = true;
             break;
         }

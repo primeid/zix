@@ -315,7 +315,7 @@ fn primAbort(st: *Eval, args: []const *Value, pos: usize) EvalError!Value {
     _ = pos;
 
     const msg = try forceStringNoCtx(st, args[0], "while evaluating the argument to builtins.abort");
-    return st.userError("abort: {s}", .{msg});
+    return st.userError("evaluation aborted with the following error message: '{s}'", .{msg});
 }
 
 fn primThrow(st: *Eval, args: []const *Value, pos: usize) EvalError!Value {
@@ -2008,6 +2008,7 @@ var env = std.array_list.Managed(drvmod.EnvPair).init(st.alloc);
     var context = std.array_list.Managed(value.CtxElem).init(st.alloc);
     var content_addressed = false;
     var is_impure = false;
+    var floating_hash = false;
     var output_hash: ?[]const u8 = null;
     var output_hash_algo: []const u8 = "sha256";
     var ingestion_method: ?store.FileIngestionMethod = null;
@@ -2154,6 +2155,23 @@ var env = std.array_list.Managed(drvmod.EnvPair).init(st.alloc);
     // Outputs
     var drv_outputs = std.array_list.Managed(drvmod.Output).init(st.alloc);
     if (output_hash) |oh| {
+        if (oh.len == 0) {
+            // Floating content-addressed derivation: the hash is filled in at
+            // build time.  Nix requires the algorithm to be explicit.
+            if (output_hash_algo.len == 0) {
+                return st.userError("empty hash requires explicit hash algorithm", .{});
+            }
+            floating_hash = true;
+            const method = ingestion_method orelse .recursive;
+            const algo_str = try std.fmt.allocPrint(st.alloc, "{s}sha256", .{store.ingestionPrefix(method)});
+            // Like Nix's CAFloating: the output path is computed from the
+            // derivation hash; the drv records the zero hash.  The env `out`
+            // entry is added now (before the env sort) and replaced with the
+            // real path once the drv hash is known.
+            const zeros = "0000000000000000000000000000000000000000000000000000000000000000";
+            try setEnv(st, &env, "out", try hashPlaceholder(st, "out"));
+            try drv_outputs.append(.{ .name = "out", .path = "", .hash_algo = algo_str, .hash = zeros });
+        } else {
         // fixed-output derivation
         if (outputs.items.len != 1 or !std.mem.eql(u8, outputs.items[0], "out")) {
             return st.userError("multiple outputs are not supported in fixed-output derivations", .{});
@@ -2163,15 +2181,16 @@ var env = std.array_list.Managed(drvmod.EnvPair).init(st.alloc);
         if (output_hash_algo.len > 0 and !std.mem.eql(u8, output_hash_algo, "sha256")) {
             return st.userError("unsupported hash algorithm '{s}' (zix only supports sha256)", .{output_hash_algo});
         }
-        const hash = nixhash.parseHash(st.alloc, oh) catch return st.userError("invalid hash '{s}'", .{oh});
-        const method = ingestion_method orelse .flat;
-        const out_path = st.store.makeFixedOutputPath(drv_name, method, hash, &.{}) catch |e| {
-            return st.userError("cannot compute output path: {s}", .{@errorName(e)});
-        };
-        try setEnv(st, &env, "out", out_path);
-        const algo_str = try std.fmt.allocPrint(st.alloc, "{s}sha256", .{store.ingestionPrefix(method)});
-        const hex = try hash.base16(st.alloc);
-        try drv_outputs.append(.{ .name = "out", .path = out_path, .hash_algo = algo_str, .hash = hex });
+            const hash = nixhash.parseHash(st.alloc, oh) catch return st.userError("invalid hash '{s}'", .{oh});
+            const method = ingestion_method orelse .flat;
+            const out_path = st.store.makeFixedOutputPath(drv_name, method, hash, &.{}) catch |e| {
+                return st.userError("cannot compute output path: {s}", .{@errorName(e)});
+            };
+            try setEnv(st, &env, "out", out_path);
+            const algo_str = try std.fmt.allocPrint(st.alloc, "{s}sha256", .{store.ingestionPrefix(method)});
+            const hex = try hash.base16(st.alloc);
+            try drv_outputs.append(.{ .name = "out", .path = out_path, .hash_algo = algo_str, .hash = hex });
+        }
     } else if (content_addressed or is_impure) {
         const method = ingestion_method orelse .recursive;
         const algo_str = try std.fmt.allocPrint(st.alloc, "{s}sha256", .{store.ingestionPrefix(method)});
@@ -2216,7 +2235,7 @@ var env = std.array_list.Managed(drvmod.EnvPair).init(st.alloc);
     };
 
     // Compute output paths for input-addressed derivations.
-    if (output_hash == null and !content_addressed and !is_impure) {
+    if ((output_hash == null or floating_hash) and !content_addressed and !is_impure) {
         var memo = std.StringHashMap(nixhash.Hash).init(st.alloc);
         var read_ctx = DrvReadCtx{ .st = st };
         const outs = drvmod.hashDerivationModulo(st.alloc, &st.store, &drv, true, DrvReadCtx.read, &read_ctx, &memo) catch |e| {

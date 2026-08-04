@@ -774,7 +774,7 @@ pub const Lexer = struct {
             const t = try self.nextToken();
             switch (t.kind) {
                 .eof => return error.UnterminatedInterpolation,
-                .lbrace => {
+                .lbrace, .dollcurly => {
                     depth += 1;
                     try toks.append(t);
                 },

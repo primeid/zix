@@ -10,6 +10,9 @@ const drvmod = @import("drv.zig");
 const nixhash = @import("nixhash.zig");
 const fsutil = @import("fsutil.zig");
 
+// `nix/fetchurl.nix` — the real Nix 2.34 corepkgs fetchurl builder.
+pub const fetchurl_nix_src: []const u8 =
+    "{\n  system ? \"\", # obsolete\n  url,\n  hash ? \"\", # an SRI hash\n\n  # Legacy hash specification\n  md5 ? \"\",\n  sha1 ? \"\",\n  sha256 ? \"\",\n  sha512 ? \"\",\n  outputHash ?\n    if hash != \"\" then\n      hash\n    else if sha512 != \"\" then\n      sha512\n    else if sha1 != \"\" then\n      sha1\n    else if md5 != \"\" then\n      md5\n    else\n      sha256,\n  outputHashAlgo ?\n    if hash != \"\" then\n      \"\"\n    else if sha512 != \"\" then\n      \"sha512\"\n    else if sha1 != \"\" then\n      \"sha1\"\n    else if md5 != \"\" then\n      \"md5\"\n    else\n      \"sha256\",\n\n  executable ? false,\n  unpack ? false,\n  name ? baseNameOf (toString url),\n  impure ? false,\n}:\n\nderivation (\n  {\n    builder = \"builtin:fetchurl\";\n\n    # New-style output content requirements.\n    outputHashMode = if unpack || executable then \"recursive\" else \"flat\";\n\n    inherit\n      name\n      url\n      executable\n      unpack\n      ;\n\n    system = \"builtin\";\n\n    # No need to double the amount of network traffic\n    preferLocalBuild = true;\n\n    # This attribute does nothing; it's here to avoid changing evaluation results.\n    impureEnvVars = [\n      \"http_proxy\"\n      \"https_proxy\"\n      \"ftp_proxy\"\n      \"all_proxy\"\n      \"no_proxy\"\n    ];\n\n    # To make \"nix-prefetch-url\" work.\n    urls = [ url ];\n  }\n  // (if impure then { __impure = true; } else { inherit outputHashAlgo outputHash; })\n)\n";
 pub const Eval = eval.EvalState;
 pub const Value = value.Value;
 pub const EvalError = eval.EvalError;
@@ -231,7 +234,6 @@ pub fn makeBuiltins(st: *Eval) !Init {
         }
     }.lt);
     builtins_attrs.* = .{ .items = items.items };
-
     // `derivation` wrapper — embedded from Nix 2.34 corepkgs/derivation.nix
     {
         const src = derivationWrapperSrc;
@@ -592,12 +594,20 @@ fn primFilter(st: *Eval, args: []const *Value, pos: usize) EvalError!Value {
 fn primFoldl(st: *Eval, args: []const *Value, pos: usize) EvalError!Value {
 
     const fun = args[0].*;
-    const acc: *Value = args[1];
+    // Every step binds the accumulator to a *fresh* heap slot: the fold
+    // lambda (and any thunks it creates) captures the accumulator pointer, so
+    // a shared/mutated slot would make those thunks see later values
+    // (self-reference cycles like
+    // `foldl' (res: opt: res // { options = [1] ++ res.options; }) ...`).
     const list = try forceList(st, args[2], "");
+    var acc = try st.alloc.create(Value);
+    acc.* = args[1].*;
     for (list) |elem| {
         var r = try st.apply(fun, acc, pos);
         r = try st.apply(r, elem, pos);
-        acc.* = r;
+        const fresh = try st.alloc.create(Value);
+        fresh.* = r;
+        acc = fresh;
     }
     return acc.*;
 }
@@ -1008,8 +1018,8 @@ fn primZipAttrsWith(st: *Eval, args: []const *Value, pos: usize) EvalError!Value
         v.* = .{ .list = vals.items[i].items };
         const name_v = try st.alloc.create(Value);
         name_v.* = st.mkString(k, &.{});
-        var r = try st.apply(fun, name_v, pos);
-        r = try st.apply(r, v, pos);
+        // Lazy per-key merge (like Nix): the function application is a thunk.
+        const r = try st.mkLazyApply(fun, &.{ name_v, v }, pos);
         items[i] = .{ .name = k, .value = try st.alloc.create(Value) };
         items[i].value.* = r;
     }
@@ -1059,10 +1069,11 @@ fn primSubstring(st: *Eval, args: []const *Value, pos: usize) EvalError!Value {
     const start = try forceInt(st, args[0], "");
     const len = try forceInt(st, args[1], "");
     const s = try forceStringNoCtx(st, args[2], "");
-    if (start < 0 or len < 0) return st.userError("negative start position or length in 'substring'", .{});
+    if (start < 0) return st.userError("negative start position in 'substring'", .{});
     const s_i: usize = @intCast(start);
-    const l_i: usize = @intCast(len);
     if (s_i >= s.len) return st.mkString("", &.{});
+    // A negative length means "to the end of the string" (like Nix).
+    const l_i: usize = if (len < 0) s.len - s_i else @intCast(len);
     const end = @min(s.len, s_i + l_i);
     return st.mkString(s[s_i..end], &.{});
 }
@@ -2031,13 +2042,26 @@ var env = std.array_list.Managed(drvmod.EnvPair).init(st.alloc);
             continue;
         }
         // default: environment variable (coerced with store copying)
-        const s = try st.coerceToString(&v, &context, true, true, "while evaluating a derivation attribute");
-        try env.append(.{ .name = it.name, .value = s });
         if (structured_attrs) {
+            // With `__structuredAttrs` the attribute goes into the JSON
+            // environment verbatim (sets are fine); only the few attrs the
+            // build machinery needs (builder, system, out, ...) are also
+            // coerced to strings.
             const copy = try st.alloc.create(Value);
             copy.* = v;
             try json_entries.append(.{ .name = it.name, .value = copy });
+            const s = st.coerceToString(&v, &context, true, true, "while evaluating a derivation attribute") catch {
+                // Sets are valid in the structured JSON but not as env strings;
+                // skip the env entry (like Nix).
+                continue;
+            };
+            try env.append(.{ .name = it.name, .value = s });
+            if (std.mem.eql(u8, it.name, "builder")) builder = s;
+            if (std.mem.eql(u8, it.name, "system")) platform = s;
+            continue;
         }
+        const s = try st.coerceToString(&v, &context, true, true, "while evaluating a derivation attribute");
+        try env.append(.{ .name = it.name, .value = s });
         if (std.mem.eql(u8, it.name, "builder")) builder = s;
         if (std.mem.eql(u8, it.name, "system")) platform = s;
         if (std.mem.eql(u8, it.name, "outputHash")) output_hash = s;
@@ -2061,6 +2085,25 @@ var env = std.array_list.Managed(drvmod.EnvPair).init(st.alloc);
             var it_tok = std.mem.tokenizeAny(u8, s, " \t\n");
             while (it_tok.next()) |o| try outputs.append(o);
             if (outputs.items.len == 0) return st.userError("derivation cannot have an empty set of outputs", .{});
+        }
+        // Metadata and control attributes are not environment variables
+        // (mirrors Nix's derivationStrict).
+        if (std.mem.eql(u8, it.name, "meta") or
+            std.mem.eql(u8, it.name, "passthru") or
+            std.mem.eql(u8, it.name, "preferLocalBuild") or
+            std.mem.eql(u8, it.name, "allowSubstitutes") or
+            std.mem.eql(u8, it.name, "requiredSystemFeatures") or
+            std.mem.eql(u8, it.name, "impureEnvVars") or
+            std.mem.eql(u8, it.name, "passAsFile") or
+            std.mem.eql(u8, it.name, "allowedReferences") or
+            std.mem.eql(u8, it.name, "disallowedReferences") or
+            std.mem.eql(u8, it.name, "allowedRequisites") or
+            std.mem.eql(u8, it.name, "disallowedRequisites") or
+            std.mem.eql(u8, it.name, "exportReferencesGraph") or
+            std.mem.eql(u8, it.name, "__darwinAllowLocalNetworking") or
+            std.mem.eql(u8, it.name, "__json"))
+        {
+            continue;
         }
     }
 
@@ -2115,7 +2158,9 @@ var env = std.array_list.Managed(drvmod.EnvPair).init(st.alloc);
         if (outputs.items.len != 1 or !std.mem.eql(u8, outputs.items[0], "out")) {
             return st.userError("multiple outputs are not supported in fixed-output derivations", .{});
         }
-        if (!std.mem.eql(u8, output_hash_algo, "sha256")) {
+        // SRI hashes (`sha256-<b32>`) may omit outputHashAlgo entirely; when
+        // given, it must be sha256 (the only algorithm zix supports).
+        if (output_hash_algo.len > 0 and !std.mem.eql(u8, output_hash_algo, "sha256")) {
             return st.userError("unsupported hash algorithm '{s}' (zix only supports sha256)", .{output_hash_algo});
         }
         const hash = nixhash.parseHash(st.alloc, oh) catch return st.userError("invalid hash '{s}'", .{oh});
@@ -2200,19 +2245,29 @@ var env = std.array_list.Managed(drvmod.EnvPair).init(st.alloc);
         std.debug.print("DRVREFS: {any}\n", .{refs.items});
     }
     const drv_file_name = try std.fmt.allocPrint(st.alloc, "{s}.drv", .{drv_name});
-    const drv_path = st.store.writeText(drv_file_name, contents, refs.items) catch |e| {
-        return st.userError("cannot write derivation to store: {s}", .{@errorName(e)});
-    };
+    // Read-only mode: compute the path without writing it (like `nix eval`).
+    const drv_path = if (st.store.read_only)
+        st.store.makeTextPath(drv_file_name, nixhash.Hash.of(contents), refs.items) catch |e| {
+            return st.userError("cannot compute derivation path: {s}", .{@errorName(e)});
+        }
+    else
+        st.store.writeText(drv_file_name, contents, refs.items) catch |e| {
+            return st.userError("cannot write derivation to store: {s}", .{@errorName(e)});
+        };
 
     // Result: { drvPath, <outputs> }
     const n = drv_outputs.items.len + 1;
     const items = try st.alloc.alloc(value.Item, n);
+    const drvp_ctx = try st.alloc.alloc(value.CtxElem, 1);
+    drvp_ctx[0] = .{ .kind = .drv_deep, .path = drv_path };
     const drvp_v = try st.alloc.create(Value);
-    drvp_v.* = st.mkString(drv_path, &.{.{ .kind = .drv_deep, .path = drv_path }});
+    drvp_v.* = st.mkString(drv_path, drvp_ctx);
     items[0] = .{ .name = "drvPath", .value = drvp_v };
     for (drv_outputs.items, 0..) |o, i| {
         const v = try st.alloc.create(Value);
-        v.* = st.mkString(o.path, &.{.{ .kind = .drv_out, .path = drv_path, .output = o.name }});
+        const octx = try st.alloc.alloc(value.CtxElem, 1);
+        octx[0] = .{ .kind = .drv_out, .path = drv_path, .output = o.name };
+        v.* = st.mkString(o.path, octx);
         items[i + 1] = .{ .name = o.name, .value = v };
     }
     return st.mkAttrs(items);
@@ -2256,6 +2311,9 @@ fn escapeJsonString(s: []const u8) []const u8 {
 }
 
 fn jsonWrite(st: *Eval, v: *Value, w: *std.array_list.Managed(u8)) EvalError!void {
+    st.json_depth += 1;
+    defer st.json_depth -= 1;
+    if (st.json_depth > 10000) return st.userError("JSON value is too deeply nested (cyclic?)", .{});
     try st.force(v);
     switch (v.*) {
         .int => |i| try w.appendSlice(try std.fmt.allocPrint(st.alloc, "{d}", .{i})),
@@ -2298,6 +2356,9 @@ fn jsonWrite(st: *Eval, v: *Value, w: *std.array_list.Managed(u8)) EvalError!voi
                 try jsonWrite(st, it.value, w);
             }
             try w.append('}');
+        },
+        .lambda => {
+            try w.appendSlice("\"<LAMBDA>\"");
         },
         else => return st.userError("cannot convert {s} to JSON", .{eval.EvalState.showType(v.*)}),
     }

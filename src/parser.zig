@@ -642,9 +642,21 @@ pub const Parser = struct {
         }
         if (t.kind == .str) {
             _ = self.advance();
-            // attribute strings must be plain (no interpolation)
-            if (t.parts.len != 1 or t.parts[0] != .lit) return error.UnexpectedToken;
-            return .{ .static = t.parts[0].lit.text };
+            if (t.parts.len == 1 and t.parts[0] == .lit) return .{ .static = t.parts[0].lit.text };
+            // Interpolated attribute name: `"${ident}Fallback"` is a dynamic
+            // attribute whose name is the concatenation of the parts.
+            const exprs = try self.alloc.alloc(*ast.Expr, t.parts.len);
+            for (t.parts, 0..) |part, i| {
+                exprs[i] = switch (part) {
+                    .lit => |lit| blk: {
+                        const parts = try self.alloc.alloc(ast.Part, 1);
+                        parts[0] = .{ .lit = lit.text };
+                        break :blk try self.allocExpr(.{ .str = .{ .parts = parts, .kind = .dquote } });
+                    },
+                    .interp => |toks2| try self.parseSub(toks2),
+                };
+            }
+            return .{ .dyn = try self.allocExpr(.{ .concat = .{ .parts = exprs } }) };
         }
         // dynamic: ${ expr }
         if (t.kind == .dollcurly) {
@@ -765,7 +777,7 @@ pub const Parser = struct {
         while (j < self.toks.len) : (j += 1) {
             const t = self.toks[j];
             switch (t.kind) {
-                .lbrace => depth += 1,
+                .lbrace, .dollcurly => depth += 1,
                 .rbrace => {
                     depth -= 1;
                     if (depth == 0) {

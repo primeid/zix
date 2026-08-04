@@ -186,6 +186,8 @@ pub const Store = struct {
         const path = try self.makeTextPath(name, hash, refs);
         if (!self.read_only) {
             try fsutil.makePath(self.store_dir);
+            if (contents.len > 1 << 26) {
+            }
             try fsutil.writeFile(path, contents);
         }
         return path;

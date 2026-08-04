@@ -57,6 +57,14 @@ pub const EvalState = struct {
     err_active: bool = false,
     /// current evaluation chain (innermost last) for cycle diagnostics
     eval_chain: std.array_list.Managed(ast.Pos) = undefined,
+    /// eqValues recursion depth (for debugging deep equality comparisons)
+    eq_depth: usize = 0,
+    /// visited (a,b) attrset pairs during deep equality (cycle detection)
+    eq_seen: std.AutoHashMap(u64, void) = undefined,
+    /// JSON serialisation depth (guards against cyclic structures)
+    json_depth: usize = 0,
+    /// temp dir where embedded corepkgs (`nix/fetchurl.nix`) are materialised
+    corepkgs_dir: []const u8 = "/tmp",
     /// error trace: innermost positions first (for Nix-style traces)
     err_trace: std.array_list.Managed(ast.Pos) = undefined,
     /// current file being evaluated (for __curPos / import paths)
@@ -83,6 +91,8 @@ pub const EvalState = struct {
             .src_to_store = std.StringHashMap([]const u8).init(alloc),
             .err_trace = std.array_list.Managed(ast.Pos).init(alloc),
             .eval_chain = std.array_list.Managed(ast.Pos).init(alloc),
+            .eq_seen = std.AutoHashMap(u64, void).init(alloc),
+            .json_depth = 0,
         };
         // builtins + base env (mutually recursive construction)
         const b = try builtins.makeBuiltins(st);
@@ -168,7 +178,7 @@ pub const EvalState = struct {
                 .thunk => |t| {
                     switch (t.state) {
                         .evaluating => {
-                            if (self.eval_chain.items.len > 0) {
+                            if (self.eval_chain.items.len > 2) {
                                 for (self.eval_chain.items) |cp| {
                                     std.debug.print("  «{s}»:{d}:{d}\n", .{ cp.file, cp.line, cp.col });
                                 }
@@ -179,6 +189,8 @@ pub const EvalState = struct {
                             v.* = t.value;
                         },
                         .unevaluated => {
+                            if (std.mem.endsWith(u8, t.expr.pos.file, "modules.nix") and t.expr.pos.line == 1075) {
+                            }
                             t.state = .evaluating;
                             const val = try self.eval(t.expr, t.env, t.pos);
                             t.value = val;
@@ -302,7 +314,13 @@ pub const EvalState = struct {
                         },
                     };
                     if (cur.* != .attrs) {
-                                        return self.userError("attribute '{s}' missing", .{name});
+                        // Nix's `expr.attr or default` returns the default for
+                        // non-attrset bases too (e.g. `null.a or "d"` == "d").
+                        if (sel.default) |d| {
+                            const defv = try self.eval(d, env, pos);
+                            return defv;
+                        }
+                        return self.userError("cannot select attribute '{s}' from {s}", .{ name, showType(cur.*) });
                     }
                     const item = cur.attrs.find(name) orelse {
                         if (sel.default) |d| {
@@ -348,6 +366,10 @@ pub const EvalState = struct {
                     const l = try self.eval(op.left, env, pos);
                     const r = try self.eval(op.right, env, pos);
                     const eq = try self.eqValues(l, r);
+                    if (self.eq_depth > 500) {
+                    }
+                    if (self.eq_depth > 10000) {
+                    }
                     return .{ .bool_ = if (op.kind == .eq) eq else !eq };
                 },
                 .and_, .or_, .impl => {
@@ -523,6 +545,19 @@ pub const EvalState = struct {
                 return .{ .builtin = nb.* };
             },
             .lambda => |lam| return self.callLambda(lam, arg, pos),
+            .attrs => {
+                // Sets with a `__functor` attribute can be called as functions
+                // (`__functor self arg`), like Nix.
+                if (f.attrs.find("__functor")) |functor| {
+                    // `set arg` == `set.__functor set arg` (the functor receives
+                    // the set itself, like Nix).
+                    const functor_v = functor.*;
+                    var self_v: Value = f;
+                    const r1 = try self.apply(functor_v, &self_v, pos);
+                    return self.apply(r1, arg, pos);
+                }
+                return self.userError("attempt to call something which is not a function but a set", .{});
+            },
             else => return self.userError("attempt to call something which is not a function but {s}", .{showType(f)}),
         }
     }
@@ -546,24 +581,35 @@ pub const EvalState = struct {
             return self.userError("function called with unexpected argument (expected a set)", .{});
         }
         const arg_attrs = av.attrs;
-        var vars = std.array_list.Managed(Var).init(self.alloc);
+        // Nix binds *all* formals in one scope, so a default may reference any
+        // other formal (earlier or later, e.g. `{ a ? b, b ? 2 }: a`).  Create
+        // the slots and env first, then fill defaults as thunks over that env.
+        const var_count = formals.formals.len + @intFromBool(params.arg_name != null);
+        const vars = try self.alloc.alloc(Var, var_count);
+        var vi: usize = 0;
         if (params.arg_name) |name| {
-            try vars.append(.{ .name = name, .value = av });
+            vars[vi] = .{ .name = name, .value = av };
+            vi += 1;
         }
-        // Defaults can reference `@args` and previously-bound formals, so they
-        // are evaluated in an env snapshot of what has been bound so far.
+        const fenv = try self.alloc.create(Env);
+        fenv.* = .{ .parent = lam.env, .vars = vars[0..vi] }; // placeholder; filled below
         for (formals.formals) |formal| {
             const slot = try self.alloc.create(Value);
+            vars[vi] = .{ .name = formal.name, .value = slot };
+            vi += 1;
+        }
+        fenv.vars = vars[0..vi];
+        vi = @intFromBool(params.arg_name != null);
+        for (formals.formals) |formal| {
+            const slot = vars[vi].value;
+            vi += 1;
             if (arg_attrs.find(formal.name)) |item| {
                 slot.* = item.*;
             } else if (formal.default) |d| {
-                const cur_env = try self.alloc.create(Env);
-                cur_env.* = .{ .parent = lam.env, .vars = vars.items };
-                slot.* = try self.mkThunk(d, cur_env, pos);
+                slot.* = try self.mkThunk(d, fenv, pos);
             } else {
                 return self.userError("function 'anonymous lambda' called without required argument '{s}'", .{formal.name});
             }
-            try vars.append(.{ .name = formal.name, .value = slot });
         }
         if (!formals.ellipsis) {
             for (arg_attrs.items) |item| {
@@ -579,9 +625,7 @@ pub const EvalState = struct {
                 }
             }
         }
-        const env = try self.alloc.create(Env);
-        env.* = .{ .parent = lam.env, .vars = vars.items };
-        return self.eval(params.body, env, pos);
+        return self.eval(params.body, fenv, pos);
     }
 
     // ------------------------------------------------------------------
@@ -598,30 +642,29 @@ pub const EvalState = struct {
             pos: ast.Pos = .{},
         };
         var groups = std.array_list.Managed(Group).init(self.alloc);
+        var skip_bind = false;
         var names = std.array_list.Managed([]const u8).init(self.alloc);
         for (binds) |bind| {
             const gpos = bind.pos;
-            var name: []const u8 = undefined;
+            const dyn_name = switch (bind.path[0]) {
+                .static => |n| n,
+                .dyn => |e| blk: {
+                    var dv = try self.evalAndForce(e, env, pos);
+                    // `{ ${null} = ...; }` — the attribute is dropped (like Nix).
+                    if (dv == .null_) skip_bind = true;
+                    break :blk if (dv == .null_) "" else try self.coerceToPlainString(&dv, "while evaluating a dynamic attribute");
+                },
+            };
+            if (skip_bind) {
+                skip_bind = false;
+                continue;
+            }
+            const name: []const u8 = dyn_name;
             var rest_binds: []const ast.AttrBind = &.{};
-            if (bind.path.len == 1) {
-                name = switch (bind.path[0]) {
-                    .static => |n| n,
-                    .dyn => |e| blk: {
-                        var dv = try self.evalAndForce(e, env, pos);
-                        break :blk try self.coerceToPlainString(&dv, "while evaluating a dynamic attribute");
-                    },
-                };
-            } else {
-                name = switch (bind.path[0]) {
-                    .static => |n| n,
-                    .dyn => |e| blk: {
-                        var dv = try self.evalAndForce(e, env, pos);
-                        break :blk try self.coerceToPlainString(&dv, "while evaluating a dynamic attribute");
-                    },
-                };
+            if (bind.path.len > 1) {
                 // nested: a.b.c — represent rest as a bind with path[1..]
                 const nb = try self.alloc.create(ast.AttrBind);
-                nb.* = .{ .path = bind.path[1..], .value = bind.value, .inherit_from = bind.inherit_from };
+                nb.* = .{ .path = bind.path[1..], .value = bind.value, .inherit_from = bind.inherit_from, .pos = bind.pos };
                 rest_binds = @constCast(&[_]ast.AttrBind{nb.*});
             }
             var found: ?usize = null;
@@ -817,6 +860,11 @@ pub const EvalState = struct {
                     var ov = op.*;
                     return self.coerceToString(&ov, ctx, copy_to_store, coerce_more, err_ctx);
                 }
+                var nm = std.array_list.Managed(u8).init(self.alloc);
+                for (a.items[0..@min(a.items.len, 8)]) |it| {
+                    nm.appendSlice(it.name) catch {};
+                    nm.append(' ') catch {};
+                }
                 return self.userError("cannot coerce {s} to a string: {s}", .{ showType(v.*), err_ctx });
             },
             else => {
@@ -874,10 +922,28 @@ pub const EvalState = struct {
     // ------------------------------------------------------------------
 
     pub fn eqValues(self: *EvalState, a: Value, b: Value) EvalError!bool {
+        self.eq_depth += 1;
+        defer self.eq_depth -= 1;
+        // A value is trivially equal to itself (same object).
+        if (std.meta.activeTag(a) == .attrs and std.meta.activeTag(b) == .attrs and a.attrs == b.attrs) return true;
+        // Cycle detection: comparing a cyclic structure (e.g. the
+        // makeOverridable `all` output chain) would recurse forever.  A
+        // revisited *distinct* pair means the structures differ only by their
+        // cycles, so they are not equal.
+        if (std.meta.activeTag(a) == .attrs and std.meta.activeTag(b) == .attrs) {
+            const key = @intFromPtr(a.attrs) *% 0x9E3779B1 +% @intFromPtr(b.attrs);
+            if (self.eq_seen.contains(key)) return false;
+            self.eq_seen.put(key, {}) catch {};
+            defer _ = self.eq_seen.remove(key);
+        }
+        if (self.eq_depth > 100000) return false;
         var av = a;
         var bv = b;
         try self.force(&av);
         try self.force(&bv);
+        // Same forced object on both sides: trivially equal (this also
+        // terminates comparisons of cyclic structures with themselves).
+        if (std.meta.activeTag(av) == .attrs and std.meta.activeTag(bv) == .attrs and av.attrs == bv.attrs) return true;
         switch (av) {
             .int => |i| return switch (bv) {
                 .int => |j| i == j,
@@ -891,10 +957,12 @@ pub const EvalState = struct {
             },
             .bool_ => |x| return bv == .bool_ and x == bv.bool_,
             .null_ => return bv == .null_,
-            .string => |s| return switch (bv) {
-                .string => |t| std.mem.eql(u8, s.s, t.s),
-                .path => |p| std.mem.eql(u8, s.s, p.p),
-                else => false,
+            .string => |s| {
+                return switch (bv) {
+                    .string => |t| std.mem.eql(u8, s.s, t.s),
+                    .path => |p| std.mem.eql(u8, s.s, p.p),
+                    else => false,
+                };
             },
             .path => |p| return switch (bv) {
                 .path => |q| std.mem.eql(u8, p.p, q.p),
@@ -935,6 +1003,16 @@ pub const EvalState = struct {
     // ------------------------------------------------------------------
 
     pub fn findFile(self: *EvalState, name: []const u8) EvalError![]const u8 {
+        // Core packages (`nix/...`) are served from embedded Nix sources.
+        if (std.mem.startsWith(u8, name, "nix/")) {
+            if (std.mem.eql(u8, name, "nix/fetchurl.nix")) {
+                const resolved = try std.fs.path.join(self.alloc, &.{ self.corepkgs_dir, "fetchurl.nix" });
+                fsutil.writeFile(resolved, builtins.fetchurl_nix_src) catch {};
+                return resolved;
+            }
+            // `nix/derivation.nix` is handled by the builtin `derivation`.
+            return self.userErrorKind(.thrown, "cannot find '{s}' in the search path", .{name});
+        }
         for (self.nix_path) |entry| {
             const prefix = if (entry.prefix.len > 0) entry.prefix else std.fs.path.basename(entry.path);
             if (std.mem.eql(u8, prefix, name) or

@@ -1392,10 +1392,9 @@ fn primCurrentTime(st: *Eval, args: []const *Value, pos: usize) EvalError!Value 
     _ = args;
     _ = pos;
 
-    // epoch seconds (Linux)
-    var ts: std.os.linux.timespec = undefined;
-    _ = std.os.linux.clock_gettime(.REALTIME, &ts);
-    return .{ .int = @intCast(ts.sec) };
+    // epoch seconds (portable via std.Io.Clock)
+    const ts = std.Io.Clock.now(.real, fsutil.io);
+    return .{ .int = @divTrunc(ts.nanoseconds, 1_000_000_000) };
 }
 
 fn primNixVersion(st: *Eval, args: []const *Value, pos: usize) EvalError!Value {

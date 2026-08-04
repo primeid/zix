@@ -10,15 +10,26 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        include:
+          - os: ubuntu-latest
+            triple: x86_64-linux
+          - os: macos-latest
+            triple: aarch64-macos
+          - os: windows-latest
+            triple: x86_64-windows
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Zig 0.16.0
-        uses: mlugg/setup-zig@v1
-        with:
-          version: 0.16.0
+      - name: Install Zig 0.16.0 (ziglang.org)
+        shell: bash
+        run: |
+          set -eux
+          curl -L -o zig.tar \
+            "https://ziglang.org/download/0.16.0/zig-${{ matrix.triple }}-0.16.0.tar.xz"
+          tar -xJf zig.tar
+          echo "$PWD/zig-${{ matrix.triple }}-0.16.0" >> "$GITHUB_PATH"
+          zig version
 
       - name: Build
         run: zig build

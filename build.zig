@@ -39,4 +39,16 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_lib_tests.step);
     test_step.dependOn(&run_exe_tests.step);
+
+    // `zig build verify`: run the nix-vs-zix comparison battery and the
+    // golden language tests (requires `nix` on PATH).
+    const verify_step = b.step("verify", "Run the nix-vs-zix comparison battery (requires nix)");
+    const verify_cmd = b.addSystemCommand(&.{ "bash", "tests/nix-vs-zix.sh" });
+    verify_step.dependOn(&verify_cmd.step);
+    verify_cmd.step.dependOn(b.getInstallStep());
+
+    const lang_step = b.step("lang", "Run the golden language tests (tests/lang)");
+    const lang_cmd = b.addSystemCommand(&.{ "bash", "tests/run-lang.sh" });
+    lang_step.dependOn(&lang_cmd.step);
+    lang_cmd.step.dependOn(b.getInstallStep());
 }

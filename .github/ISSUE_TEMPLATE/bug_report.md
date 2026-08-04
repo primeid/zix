@@ -1,26 +1,26 @@
 ---
 name: Bug report
-about: Rapporter en feil — gjerne med sammenligning mot ekte nix
+about: Report a bug — ideally with a comparison against real nix
 title: ""
 labels: bug
 assignees: ""
 ---
 
-**Beskriv feilen**
+**Describe the bug**
 
-**Hvordan reprodusere**
+**How to reproduce**
 
 ```console
 $ zix eval -E '…'
 ```
 
-**Forventet / faktisk**
+**Expected / actual**
 
-| | Utdata |
+| | Output |
 |---|---|
 | `zix` | … |
 | `nix eval --expr '…'` | … |
 
-**Miljø**: OS, Zig-versjon (`zig version`), zix-revisjon (`git rev-parse HEAD`).
+**Environment**: OS, Zig version (`zig version`), ZIX revision (`git rev-parse HEAD`).
 
-**Er det en kompatibilitetsfeil?** Ja / nei / usikker
+**Is this a compatibility bug?** Yes / No / Not sure

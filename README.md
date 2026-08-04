@@ -1,31 +1,33 @@
-# ZIX — Nix-språket i Zig
+# ZIX — The Nix language in Zig
 
 [![CI](https://github.com/primeid/zix/actions/workflows/ci.yml/badge.svg)](https://github.com/primeid/zix/actions/workflows/ci.yml)
 [![Zig](https://img.shields.io/badge/Zig-0.16.0-f7a41d?logo=zig&logoColor=white)](https://ziglang.org)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-> **Nix-uttrykksspråket, reimplementert i Zig — bit-for-bit-kompatibelt med Nix 2.34.**
+> **The Nix expression language, reimplemented in Zig — bit-for-bit compatible with Nix 2.34.**
 
-ZIX er en uavhengig implementasjon av **Nix-uttrykksspråket** i
-[Zig](https://ziglang.org) 0.16. Den evaluerer Nix-uttrykk og produserer
-store paths, `.drv`-filer og derivasjonsattributter som er **identiske** med
-det ekte `nix` gir — hvert eneste sti-resultat er verifisert mot Nix 2.34.7.
+ZIX is an independent implementation of the **Nix expression language** in
+[Zig](https://ziglang.org) 0.16. It evaluates Nix expressions and produces
+store paths, `.drv` files and derivation attributes that are **identical** to
+what the real `nix` produces — every single path result is verified against
+Nix 2.34.7.
 
-**Hva som gjør ZIX spennende:**
-- 🎯 **Kompatibilitet som testbar egenskap** — testene sammenligner med ekte Nix-utdata.
-- ⚡ **Rask** — 50 000 elementers `foldl'` i ~80 ms; lazy evaluator med memoiserte thunks.
-- 🔍 **Liten og lesbar kodebase** — ~9 000 linjer Zig, null runtime-avhengigheter.
-- 🧩 **Bygget på Nix' egen kilde** — algoritmene er modellert direkte på `path.cc`, `derivations.cc`, `parser.y`, `lexer.l` med nøyaktig samme semantikk.
+**What makes ZIX interesting:**
+- 🎯 **Compatibility as a testable property** — tests compare against real Nix output.
+- ⚡ **Fast** — a 50 000-element `foldl'` in ~80 ms; a lazy evaluator with memoized thunks.
+- 🔍 **Small and readable codebase** — ~9 000 lines of Zig, zero runtime dependencies.
+- 🧩 **Built from Nix's own source** — the algorithms are modeled directly on
+  `path.cc`, `derivations.cc`, `parser.y`, `lexer.l` with exactly the same semantics.
 
 ---
 
-## Bygge og kjøre
+## Building and running
 
-Krav: [Zig 0.16.0](https://ziglang.org/download/) (eller `nix develop` for et ferdig miljø).
+Requirements: [Zig 0.16.0](https://ziglang.org/download/) (or `nix develop` for a ready-made environment).
 
 ```console
-$ zig build            # bygger zig-out/bin/zix (ReleaseSafe som standard)
-$ zig build test       # 24 tester, inkl. store-path-verifisering mot ekte Nix
+$ zig build            # builds zig-out/bin/zix (ReleaseSafe by default)
+$ zig build test       # 24 tests, incl. store-path verification against real Nix
 ```
 
 ```console
@@ -34,119 +36,119 @@ $ zix eval -E '1 + 2 * 3'
 $ zix eval -E 'builtins.map (x: x * x) [1 2 3 4]'
 [ 1 4 9 16 ]
 $ zix eval --read-only -E '(builtins.derivation { name = "t"; system = "x86_64-linux"; builder = "/bin/sh"; }).drvPath' --raw
-/nix/store/k79611g7bg62d41fh6bvm7xpf1dl2x91-testdrv.drv   # = ekte nix
+/nix/store/k79611g7bg62d41fh6bvm7xpf1dl2x91-testdrv.drv   # = real nix
 ```
 
-Alternativer: `--raw` (rå strenger), `--read-only` (ikke skriv til store),
-`--store-dir DIR` (egen store, f.eks. `/tmp/zs`), `-I path` / `NIX_PATH`
-for `<nixpkgs>`-oppslag, `zix parse FIL` (kun lex+parse).
+Options: `--raw` (raw strings), `--read-only` (don't write to the store),
+`--store-dir DIR` (own store, e.g. `/tmp/zs`), `-I path` / `NIX_PATH`
+for `<nixpkgs>` lookup, `zix parse FILE` (lex+parse only).
 
-Eksempler ligger i [`examples/`](examples/).
+Examples live in [`examples/`](examples/).
 
-## Arkitektur
+## Architecture
 
-| Modul | Innhold |
+| Module | Contents |
 |---|---|
-| `src/lexer.zig` | Tokenisering tro mot `lexer.l`: stier, URI-er, `"…"`- og `''…''`-strenger med interpolasjon, kommentarer |
-| `src/parser.zig` | Recursive-descent-parser tro mot `parser.y`: hele grammatikken, presedens, `stripIndentation` bit-for-bit |
-| `src/value.zig` | Verdier: int/float/bool/null, strenger med derivasjons-kontekst, lister, attrsets, lambdas, thunks |
-| `src/eval.zig` | Lazy evaluator: memoiserte thunks, `rec`/`let`/`with`, scoping, dyp likhet, strengkonkatenering |
-| `src/builtins.zig` | ~85 primops: aritmetikk, lister, attrsets, strenger+regex, JSON, filer/store, `import`, `derivationStrict` + `derivation`-wrappere |
-| `src/drv.zig` | `.drv`-ATerm-serialisering/-parsing og `hashDerivationModulo` |
-| `src/store.zig` | Store-path-beregning (`makeStorePath`/`makeOutputPath`/`makeFixedOutputPath`/`makeTextPath`), NAR-serialisering |
-| `src/nixhash.zig` | SHA-256, base16, Nix base32 («nix32»), hash-komprimering |
+| `src/lexer.zig` | Tokenization faithful to `lexer.l`: paths, URIs, `"…"` and `''…''` strings with interpolation, comments |
+| `src/parser.zig` | Recursive-descent parser faithful to `parser.y`: the whole grammar, precedence, `stripIndentation` bit-for-bit |
+| `src/value.zig` | Values: int/float/bool/null, strings with derivation context, lists, attrsets, lambdas, thunks |
+| `src/eval.zig` | Lazy evaluator: memoized thunks, `rec`/`let`/`with`, scoping, deep equality, string concatenation |
+| `src/builtins.zig` | ~85 primops: arithmetic, lists, attrsets, strings+regex, JSON, files/store, `import`, `derivationStrict` + `derivation` wrappers |
+| `src/drv.zig` | `.drv` ATerm serialization/parsing and `hashDerivationModulo` |
+| `src/store.zig` | Store path computation (`makeStorePath`/`makeOutputPath`/`makeFixedOutputPath`/`makeTextPath`), NAR serialization |
+| `src/nixhash.zig` | SHA-256, base16, Nix base32 ("nix32"), hash compression |
 
-Alt hash- og sti-relatert er modellert direkte på Nix-kilden
+All hashing and path logic is modeled directly on the Nix source
 (`path.cc`, `store-dir-config.cc`, `derivations.cc`, `hash.cc`, `archive.cc`,
-`parser.y`, `lexer.l`) og verifisert mot `nix 2.34.7` på denne maskinen:
+`parser.y`, `lexer.l`) and verified against `nix 2.34.7` on this machine:
 `builtins.toFile`, input-addressed derivations, fixed-output
-(flat + recursive) og derivations med input-referanser gir nøyaktig samme
-store paths.
+(flat + recursive) and derivations with input references produce exactly the
+same store paths.
 
 ## Status
 
-**Ferdig og verifisert mot Nix 2.34.7:**
+**Done and verified against Nix 2.34.7:**
 
-- **Hele språket**: literaler, strenger/interpolasjon, indented strings, stier,
-  operatorer (`+ - * / // ++ == != < > <= >= && || -> ! ?`), attrsets
-  (inkl. `inherit`, dynamiske attributter, nesting), `let`/`rec`/`with`/
-  `assert`/`if`, lambdaer med formals/standardverdier/`@`, lister,
-  `<nixpkgs>`-oppslag, `import`.
-- **Lazy evaluering** med memoization, syklusdeteksjon og dyp-rekursjonsbeskyttelse.
-- **Derivasjoner**: `builtins.derivation`/`derivationStrict` → korrekte
-  `.drv`-filer og `drvPath`/`outPath` (input-addressed, fixed-output flat+recursive,
+- **The whole language**: literals, strings/interpolation, indented strings,
+  paths, operators (`+ - * / // ++ == != < > <= >= && || -> ! ?`), attrsets
+  (incl. `inherit`, dynamic attributes, nesting), `let`/`rec`/`with`/
+  `assert`/`if`, lambdas with formals/defaults/`@`, lists,
+  `<nixpkgs>` lookup, `import`.
+- **Lazy evaluation** with memoization, cycle detection and deep-recursion protection.
+- **Derivations**: `builtins.derivation`/`derivationStrict` → correct
+  `.drv` files and `drvPath`/`outPath` (input-addressed, fixed-output flat+recursive,
   multi-output).
 - **~85 builtins**: `map`, `foldl'`, regex (`match`/`split`), `replaceStrings`,
   `compareVersions`, JSON, `hashString`, `toFile`, `readFile`, `readDir`,
-  `path`, `placeholder`, `tryEval`, `genericClosure` og mye mer.
+  `path`, `placeholder`, `tryEval`, `genericClosure` and much more.
 
-**Verifiseringsmetode:** et sammenligningsbatteri på 165 uttrykk kjører hvert
-uttrykk i både `zix` og ekte `nix 2.34.7` og krever identiske resultater —
-språk, builtins og derivasjonsstier. Se [CONTRIBUTING](CONTRIBUTING.md) for
-hvordan du kjører det selv.
+**Verification methodology:** a comparison battery of 165 expressions runs
+each expression in both `zix` and real `nix 2.34.7` and requires identical
+results — language, builtins and derivation paths. See
+[CONTRIBUTING](CONTRIBUTING.md) for how to run it yourself.
 
 ## Roadmap
 
-Den store oversikten — gjerne som [bidrag](CONTRIBUTING.md):
+The big picture — ideally as a [contribution](CONTRIBUTING.md):
 
-- [ ] **Realiseringslaget** (`zix build`): kjøre byggere i en sandkasse og
-      produsere utdata. Evalueringssiden er komplett; utførelsesiden gjenstår.
-- [ ] **Flere builtins**: `fetchGit`, `fetchTarball`, `fromTOML`,
-      `__structuredAttrs`, `builtins.path`-flagg, `scopedImport`,
-      dynamiske derivations.
-- [ ] **Nixpkgs-evaluering**: `import <nixpkgs> {}` i full skala.
-- [ ] **Posisjonssporing** i AST (for feilmeldinger og `«lambda @ …»`-utskrift).
+- [ ] **The realisation layer** (`zix build`): run builders in a sandbox and
+      produce outputs. The evaluation side is complete; the execution side remains.
+- [ ] **More builtins**: `fetchGit`, `fetchTarball`, `fromTOML`,
+      `__structuredAttrs`, `builtins.path` flags, `scopedImport`,
+      dynamic derivations.
+- [ ] **Nixpkgs evaluation**: `import <nixpkgs> {}` at full scale.
+- [ ] **Position tracking** in the AST (for error messages and `«lambda @ …»` output).
 
-## Kjente avvik fra Nix
+## Known deviations from Nix
 
-Bevisste og dokumenterte forskjeller:
+Conscious and documented differences:
 
-- **Ekstra builtins** som Nix 2.34 mangler: `bitNot`, `toUpper`, `toLower`,
-  `take`, `drop`, `reverseList`, `currentSystem` — kompatibilitetsvennlige utvidelser.
-- **`|>` / `<|`** (pipe-operators) er aktivert som standard; Nix krever
+- **Extra builtins** that Nix 2.34 lacks: `bitNot`, `toUpper`, `toLower`,
+  `take`, `drop`, `reverseList`, `currentSystem` — compatibility-friendly extensions.
+- **`|>` / `<|`** (pipe operators) are enabled by default; Nix requires
   `--extra-experimental-features pipe-operators`.
-- **Lambda-utskrift** viser `«lambda»` uten posisjon (`«lambda @ «string»:1:3»`
-  i Nix) — posisjonssporing er på roadmap.
-- **Feilmeldinger** er lik i *oppførsel* (samme tilfeller feiler), men teksten
-  er ofte kortere enn Nix sine.
-- `nixVersion` rapporterer `2.34.7` (kompatibilitet), `langVersion` = 6.
+- **Lambda printing** shows `«lambda»` without position (`«lambda @ «string»:1:3»`
+  in Nix) — position tracking is on the roadmap.
+- **Error messages** behave the same (the same cases fail), but the text is
+  often shorter than Nix's.
+- `nixVersion` reports `2.34.7` (for compatibility), `langVersion` = 6.
 
-## Bidra
+## Contributing
 
-ZIX er et lite prosjekt som er avhengig av bidragsytere. Er du interessert i
-språkimplementasjoner, Zig, Nix eller bare syntes dette var gøy?
+ZIX is a small project that depends on its contributors. Interested in
+language implementations, Zig, Nix, or just think this is fun?
 
-- Sjekk [CONTRIBUTING.md](CONTRIBUTING.md) for retningslinjer og konkrete oppgaver.
-- Les [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
-- Se [Roadmap](#roadmap) for hva som er viktigst å jobbe med.
-- Issues og PR-er er velkomne — små, fokuserte endringer med tester går raskest gjennom.
+- Check [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines and concrete tasks.
+- Read [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
+- See [Roadmap](#roadmap) for what matters most.
+- Issues and PRs are welcome — small, focused changes with tests move fastest.
 
-## Analyse: hvorfor (og hvorfor ikke) omskrive Nix til Zig
+## Analysis: why (and why not) rewrite Nix in Zig
 
-Følgende er en gjennomgang av fordeler, kostnader og risiko ved å omskrive
-Nix-språket/implementasjonen fra C++/OCaml til Zig — tatt med i sin helhet.
+The following is a walkthrough of the benefits, costs and risks of rewriting
+the Nix language/implementation from C++/OCaml to Zig — included in full.
 
-Hvis du mener **å omskrive Nix-språket eller Nix evaluator/implementasjonen fra C++/OCaml til Zig**, er det flere mulige fordeler, men også betydelige kostnader.
+If you mean **rewriting the Nix language or the Nix evaluator/implementation from C++/OCaml to Zig**, there are several possible benefits, but also significant costs.
 
-### Mulige fordeler med Zig
+### Possible benefits of Zig
 
-| Område                    | Potensiell fordel                                                                                                                     |
+| Area | Potential benefit |
 | ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
-| **Ytelse**                | Lavt overhead og god kontroll over minne og datastrukturer kan gi raskere evaluering og mindre ressursbruk.                           |
-| **Minnebruk**             | Eksplisitt minnehåndtering og allocators gjør det mulig å optimalisere minneforbruket mer presist.                                    |
-| **Enklere kodebase**      | Zig har et relativt lite og konsistent språk sammenlignet med C++ og kan redusere kompleksiteten i implementasjonen.                  |
-| **Portabilitet**          | Zig har svært god cross-compilation og kan gjøre det enklere å bygge Nix-komponenter for Linux, macOS, Windows og andre plattformer.  |
-| **C-interoperabilitet**   | Zig kan integreres direkte med C-biblioteker uten behov for et omfattende FFI-lag. Dette er relevant for Nix' eksisterende økosystem. |
-| **Feilhåndtering**        | Zig har eksplisitt error handling, som kan gjøre kritiske deler av evaluator- og build-systemkoden lettere å følge.                   |
-| **Færre avhengigheter**   | Zig-kompilatoren er relativt selvstendig og kan potensielt gjøre bootstrap og distribusjon enklere.                                   |
-| **Sikkerhet**             | Selv om Zig ikke er memory-safe på samme måte som Rust, gir språket bedre verktøy for å oppdage enkelte feil enn tradisjonell C/C++.  |
-| **Utviklerproduktivitet** | En mindre og mer moderne språkmodell kan gjøre det lettere for nye utviklere å bidra enn en stor C++-kodebase.                        |
+| **Performance** | Low overhead and good control over memory and data structures can give faster evaluation and lower resource usage. |
+| **Memory usage** | Explicit memory management and allocators make it possible to optimize memory consumption more precisely. |
+| **Simpler codebase** | Zig is a relatively small and consistent language compared with C++ and can reduce the complexity of the implementation. |
+| **Portability** | Zig has excellent cross-compilation and can make it easier to build Nix components for Linux, macOS, Windows and other platforms. |
+| **C interoperability** | Zig integrates directly with C libraries without needing an extensive FFI layer. This is relevant to Nix's existing ecosystem. |
+| **Error handling** | Zig has explicit error handling, which can make critical parts of the evaluator and build-system code easier to follow. |
+| **Fewer dependencies** | The Zig compiler is relatively self-contained and can potentially make bootstrap and distribution simpler. |
+| **Safety** | Although Zig is not memory-safe in the same way as Rust, the language offers better tools for catching certain bugs than traditional C/C++. |
+| **Developer productivity** | A smaller, more modern language model can make it easier for new developers to contribute than a large C++ codebase. |
 
-### Den største potensielle gevinsten
+### The biggest potential win
 
-Jeg tror den mest interessante fordelen ikke nødvendigvis er **rå ytelse**, men **vedlikeholdbarhet og portabilitet**.
+I believe the most interesting benefit is not necessarily **raw performance**, but **maintainability and portability**.
 
-Nix er i praksis flere ting samtidig:
+Nix is in practice several things at once:
 
 ```text
 Nix language
@@ -170,43 +172,43 @@ Sandboxing
 Binary caches / deployment
 ```
 
-Hvis den sentrale implementasjonen ble skrevet i Zig, kunne man potensielt få en **mindre, mer homogen og lettere porterbar runtime**. Det kunne gjøre det enklere å kjøre Nix-komponenter på flere plattformer og bygge dem fra kildekode.
+If the core implementation were written in Zig, one could potentially get a **smaller, more homogeneous and more easily portable runtime**. That could make it easier to run Nix components on more platforms and build them from source.
 
-### Men: Zig løser ikke nødvendigvis Nix' største problemer
+### But: Zig does not necessarily solve Nix's biggest problems
 
-Det er viktig å skille mellom:
+It is important to distinguish between:
 
-**Nix-språket som språk**
-og
-**Nix som komplett system**.
+**The Nix language as a language**
+and
+**Nix as a complete system**.
 
-Hvis problemet er for eksempel:
+If the problem is, for example:
 
-* langsom evaluering
-* dårlig feilhåndtering
-* komplisert kodebase
-* vanskelig debugging
-* dårlig Windows-støtte
-* høy ressursbruk
+* slow evaluation
+* poor error handling
+* a complicated codebase
+* difficult debugging
+* poor Windows support
+* high resource usage
 
-kan Zig potensielt hjelpe.
+Zig can potentially help.
 
-Men hvis problemet er:
+But if the problem is:
 
-* kompleksiteten i Nix expression language
+* the complexity of the Nix expression language
 * laziness
-* hermetiske builds
+* hermetic builds
 * dependency graphs
 * reproducibility
 * flakes
 * UX
-* Nixpkgs' enorme kompleksitet
+* the enormous complexity of Nixpkgs
 
-så vil en omskriving til Zig **ikke automatisk løse dette**. Da flyttes problemene bare til en ny implementasjon.
+then a rewrite in Zig will **not automatically solve this**. The problems are simply moved to a new implementation.
 
-### Min vurdering
+### My assessment
 
-Hvis målet var å modernisere Nix, ville jeg **ikke skrevet hele Nix på nytt i Zig fra dag én**. Jeg ville vurdert en gradvis arkitektur:
+If the goal were to modernize Nix, I would **not rewrite all of Nix in Zig from day one**. I would consider a gradual architecture:
 
 ```text
               Existing Nix
@@ -226,12 +228,12 @@ Hvis målet var å modernisere Nix, ville jeg **ikke skrevet hele Nix på nytt i
                          Nix ecosystem
 ```
 
-Da kunne man først skrive **en ny evaluator i Zig**, benchmarke den mot dagens Nix og gradvis erstatte komponenter dersom fordelene faktisk materialiserer seg.
+Then one could first write **a new evaluator in Zig**, benchmark it against today's Nix and gradually replace components if the benefits actually materialize.
 
-**Kort sagt:** Zig kan potensielt gi Nix **lavere ressursbruk, enklere cross-compilation, en mer håndterbar implementasjon og bedre kontroll over runtime-ytelse**. Den største risikoen er at man bruker mange år på å omskrive et enormt og komplekst system uten å løse de underliggende problemene som faktisk gjør Nix vanskelig.
+**In short:** Zig can potentially give Nix **lower resource usage, easier cross-compilation, a more manageable implementation and better control over runtime performance**. The biggest risk is spending many years rewriting an enormous and complex system without solving the underlying problems that actually make Nix difficult.
 
-Hvis du egentlig mener **å omskrive selve Nix expression language til et nytt språk med Zig som implementasjonsspråk**, er analysen ganske annerledes. Da kan jeg også sammenligne **Nix vs. en hypotetisk "Zig-Nix"** arkitektur, inkludert hvordan man kunne bevare bakoverkompatibilitet med Nixpkgs.
+If you really mean **rewriting the Nix expression language itself into a new language with Zig as the implementation language**, the analysis is quite different. Then I can also compare **Nix vs. a hypothetical "Zig-Nix"** architecture, including how to preserve backward compatibility with Nixpkgs.
 
-## Lisens
+## License
 
-MIT — se [LICENSE](LICENSE).
+MIT — see [LICENSE](LICENSE).

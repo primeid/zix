@@ -1,17 +1,17 @@
 ---
 name: Pull request
-about: Send inn en endring
+about: Submit a change
 title: ""
 labels: ""
 assignees: ""
 ---
 
-**Hva gjør denne PR-en?**
+**What does this PR do?**
 
-**Tester** — hva er lagt til/endret, og hvordan verifiserer man det?
+**Tests** — what was added/changed, and how do you verify it?
 
-- [ ] `zig build test` passerer
-- [ ] Resultatet er verifisert mot ekte `nix` der det er relevant
-- [ ] Eventuelle avvik er dokumentert i README
+- [ ] `zig build test` passes
+- [ ] The result is verified against real `nix` where relevant
+- [ ] Any deviations are documented in the README
 
-**Relaterte issues**
+**Related issues**

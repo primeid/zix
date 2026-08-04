@@ -1,15 +1,15 @@
 ---
 name: Feature request
-about: Foreslå en utvidelse eller forbedring
+about: Suggest an extension or improvement
 title: ""
 labels: enhancement
 assignees: ""
 ---
 
-**Hva vil du legge til?** (f.eks. en builtin, `zix build`, bedre feilmeldinger …)
+**What would you like to add?** (e.g. a builtin, `zix build`, better error messages …)
 
-**Hvorfor?** (hvilket problem løser det — gjerne med et konkret eksempel)
+**Why?** (what problem does it solve — ideally with a concrete example)
 
-**Er dette nødvendig for Nix-kompatibilitet?** Ja / nei / usikker
+**Is this required for Nix compatibility?** Yes / No / Not sure
 
-**Referanser** (Nix-dokumentasjon, nixpkgs-bruk, linker …)
+**References** (Nix documentation, nixpkgs usage, links …)

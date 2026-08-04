@@ -1,63 +1,62 @@
 # Contributing to ZIX
 
-Takk for at du vurderer å bidra! ZIX er et lite, fokusert prosjekt med ett mål:
-**en bit-for-bit Nix-2.34-kompatibel implementasjon av Nix-uttrykksspråket i
-Zig**. Alle bidrag som bringer oss nærmere det målet — og holder prosjektet
-tiltrekkende for nye bidragsytere — er velkomne.
+Thanks for considering contributing! ZIX is a small, focused project with one
+goal: **a bit-for-bit Nix-2.34-compatible implementation of the Nix expression
+language in Zig**. All contributions that move us toward that goal — and keep
+the project attractive to new contributors — are welcome.
 
-## Hva som trengs hjelp med
+## What needs help
 
-Se [Roadmap i README](README.md#roadmap) for den store oversikten. Konkrete
-områder som alltid er aktuelle:
+See the [Roadmap in the README](README.md#roadmap) for the big picture.
+Concrete areas that are always relevant:
 
-- **Realiseringslaget** (`zix build`): kjøre derivasjonsbyggere i en sandkasse
-  og produsere utdata. Dette er det største og viktigste neste steget.
-- **Flere builtins**: `fetchGit`, `fetchTarball`, `fromTOML`,
-  `__structuredAttrs`, `builtins.path`-flagg, `scopedImport`, dynamiske
-  derivations.
-- **Nixpkgs-evaluering**: få `import <nixpkgs> {}` til å fungere.
-- **Testdekning**: flere enhetstester og flere nix-vs-zix-sammenligninger
-  (alle resultater verifiseres mot ekte `nix 2.34.x`).
-- **Fiks av kjente avvik** i [README](README.md#kjente-avvik).
+- **The realisation layer** (`zix build`): run derivation builders in a
+  sandbox and produce outputs. This is the biggest and most important next step.
+- **More builtins**: `fetchGit`, `fetchTarball`, `fromTOML`,
+  `__structuredAttrs`, `builtins.path` flags, `scopedImport`, dynamic derivations.
+- **Nixpkgs evaluation**: get `import <nixpkgs> {}` working.
+- **Test coverage**: more unit tests and more nix-vs-zix comparisons
+  (all results are verified against real `nix 2.34.x`).
+- **Fixes for known deviations** in the [README](README.md#known-deviations-from-nix).
 
-## Kom i gang
+## Getting started
 
 ```console
-$ zig build            # bygger zig-out/bin/zix (ReleaseSafe som standard)
-$ zig build test       # 24 tester, inkludert store-path-verifisering mot Nix
+$ zig build            # builds zig-out/bin/zix (ReleaseSafe by default)
+$ zig build test       # 24 tests, incl. store-path verification against Nix
 $ zig build run -- eval -E '1 + 2 * 3'
 ```
 
-Zig-versjonen som brukes er **0.16.0** (se `build.zig.zon`). Har du Nix kan du
-bruke `nix develop` for et miljø med riktig Zig.
+The Zig version used is **0.16.0** (see `build.zig.zon`). If you have Nix,
+`nix develop` gives you a ready-made environment.
 
-## Retningslinjer
+## Guidelines
 
-- **Kompatibilitet er en testbar egenskap.** Når du endrer evaluerings- eller
-  store-path-logikk, verifiser resultatet mot ekte Nix: `nix eval --expr '…'`
-  skal gi samme utdata som `zix eval -E '…'`. Derivasjonsstier skal være
-  identiske.
-- **Små, fokuserte PR-er.** Én endring per PR gjør det lettere å gjennomgå.
-- **Tester først.** Legg til en test som dekker endringen din; alle tester må
-  være grønne før merge (`zig build test`).
-- **Følg stilen.** Zig-formateringen er standard (`zig fmt`); hold koden
-  kompakt og lesbar. Kommentarer på engelsk.
-- **Dokumentér avvik.** Hvis zix bevisst avviker fra Nix (f.eks. ekstra
-  builtins eller aktivert pipe-operators), noter det i README.
+- **Compatibility is a testable property.** When you change evaluation or
+  store-path logic, verify the result against real Nix:
+  `nix eval --expr '…'` should produce the same output as `zix eval -E '…'`.
+  Derivation paths should be identical.
+- **Small, focused PRs.** One change per PR makes review easier.
+- **Tests first.** Add a test covering your change; all tests must be green
+  before merge (`zig build test`).
+- **Follow the style.** Zig formatting is standard (`zig fmt`); keep the code
+  compact and readable. Comments in English.
+- **Document deviations.** If ZIX intentionally deviates from Nix (e.g. extra
+  builtins or pipe operators enabled by default), note it in the README.
 
-## Feilmeldinger og issues
+## Bugs and issues
 
-- Beskriv hva du kjørte, hva som skjedde, og hva du forventet.
-- Inkluder utdata fra både `zix` og `nix` der det er relevant — det hjelper
-  oss å avgjøre om det er en kompatibilitetsfeil eller en zix-spesifikk feil.
-- Bruk gjerne [issue-templatene](.github/ISSUE_TEMPLATE/).
+- Describe what you ran, what happened, and what you expected.
+- Include output from both `zix` and `nix` where relevant — it helps us tell
+  whether something is a compatibility bug or a ZIX-specific bug.
+- Feel free to use the [issue templates](.github/ISSUE_TEMPLATE/).
 
-## Kommunikasjon
+## Communication
 
-- Issues og PR-diskusjoner foregår på GitHub.
-- Vær respektfull og konstruktiv — se [CODE_OF_CONDUCT](CODE_OF_CONDUCT.md).
+- Issue and PR discussions happen on GitHub.
+- Be respectful and constructive — see [CODE_OF_CONDUCT](CODE_OF_CONDUCT.md).
 
-## Takk!
+## Thanks!
 
-Et lite prosjekt som dette lever av bidragsyterne sine. Uansett om du fikser en
-stavefeil, skriver en test eller bygger realiseringslaget — det er verdsatt.
+A small project like this lives on its contributors. Whether you fix a typo,
+write a test or build the realisation layer — it is appreciated.

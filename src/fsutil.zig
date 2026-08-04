@@ -87,7 +87,7 @@ pub fn realpathAlloc(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
 }
 
 pub fn makePath(path: []const u8) !void {
-    std.Io.Dir.createDirAbsolute(io, path, .default_dir) catch |e| switch (e) {
+    std.Io.Dir.cwd().createDir(io, path, .default_dir) catch |e| switch (e) {
         error.PathAlreadyExists => {},
         else => return e,
     };

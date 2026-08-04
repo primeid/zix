@@ -358,18 +358,26 @@ pub fn hashRecursive(alloc: std.mem.Allocator, path: []const u8) !Hash {
 
 /// Compute the store path for copying `path` into the store (recursive
 /// sha256, no refs — the default for `import`/path coercion).
-pub fn addPathToStore(self: *const Store, name: []const u8, path: []const u8) ![]const u8 {
+/// Copy a path into the store applying a Nix filter predicate
+/// (path: type: bool) — used by `builtins.filterSource`.
+pub const FilterCtx = struct {
+    st: *anyopaque,
+    filterCheck: *const fn (ctx: *anyopaque, p: []const u8, kind: []const u8) bool,
+};
+
+pub fn addPathToStoreFiltered(self: *const Store, name: []const u8, path: []const u8, filter_ctx: FilterCtx) ![]const u8 {
     try checkName(name);
-    const st = try fsutil.statPath(path);
-    const hash = switch (st.kind) {
-        .symlink => blk: {
-            const target = try fsutil.readLinkAlloc(self.alloc, path);
-            break :blk Hash.of(target);
-        },
-        .file => try hashFlatFile(self.alloc, path),
-        .directory => try hashRecursive(self.alloc, path),
-        else => return error.NotAValidPath,
-    };
+    const nar = try narDumpFiltered(self.alloc, path, filter_ctx.st, filter_ctx.filterCheck);
+    const hash = Hash.of(nar);
+    return self.makeFixedOutputPath(name, .recursive, hash, &.{});
+}
+
+pub fn addPathToStore(self: *const Store, name: []const u8, path: []const u8) ![]const u8 {
+    // Nix's `copyPathToStore` uses `ContentAddressMethod::Raw::NixArchive`:
+    // the NAR hash of the path (files AND directories alike).
+    try checkName(name);
+    const nar = try narDump(self.alloc, path);
+    const hash = Hash.of(nar);
     return self.makeFixedOutputPath(name, .recursive, hash, &.{});
 }
 

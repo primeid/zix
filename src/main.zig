@@ -32,11 +32,13 @@ pub fn main(init: std.process.Init) !void {
     var raw = false;
     var json = false;
     var sandbox = false;
+    var impure = false;
     var read_only = false;
     var store_dir: []const u8 = init.environ_map.get("ZIX_STORE_DIR") orelse "/nix/store";
     var nix_path_extra = std.array_list.Managed([]const u8).init(a);
     var cli_args = std.array_list.Managed(ArgPair).init(a); // --arg/--argstr
     var attr_path: ?[]const u8 = null; // -A
+    var features = std.array_list.Managed([]const u8).init(a); // experimental features
 
     var i: usize = 1;
     while (i < argv.items.len) : (i += 1) {
@@ -47,6 +49,8 @@ pub fn main(init: std.process.Init) !void {
             raw = true;
         } else if (std.mem.eql(u8, arg, "--read-only")) {
             read_only = true;
+        } else if (std.mem.eql(u8, arg, "--impure")) {
+            impure = true;
         } else if (std.mem.eql(u8, arg, "--store-dir")) {
             i += 1;
             if (i >= argv.items.len) {
@@ -76,6 +80,16 @@ pub fn main(init: std.process.Init) !void {
                 std.process.exit(1);
             }
             attr_path = argv.items[i];
+        } else if (std.mem.eql(u8, arg, "--extra-experimental-features")) {
+            i += 1;
+            if (i >= argv.items.len) {
+                std.debug.print("zix: missing argument for --extra-experimental-features\n", .{});
+                std.process.exit(1);
+            }
+            var it = std.mem.splitScalar(u8, argv.items[i], ',');
+            while (it.next()) |f| {
+                if (f.len > 0) try features.append(f);
+            }
         } else if (std.mem.eql(u8, arg, "--arg") or std.mem.eql(u8, arg, "--argstr")) {
             const is_str = std.mem.eql(u8, arg, "--argstr");
             i += 1;
@@ -104,7 +118,13 @@ pub fn main(init: std.process.Init) !void {
     }
 
     const home_dir = init.environ_map.get("HOME") orelse "/";
-    const st = try eval.EvalState.init(a, store_dir, read_only, home_dir);
+    if (init.environ_map.get("ZIX_EXTRA_EXPERIMENTAL_FEATURES")) |fe| {
+        var it = std.mem.splitScalar(u8, fe, ',');
+        while (it.next()) |f| {
+            if (f.len > 0) try features.append(f);
+        }
+    }
+    const st = try eval.EvalState.initFull(a, store_dir, read_only, home_dir, features.items, impure);
     defer st.deinit();
     st.environ = init.environ_map;
     st.nix_path = try parseNixPath(a, init.environ_map, nix_path_extra.items);

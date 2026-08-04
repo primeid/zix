@@ -63,6 +63,16 @@ pub const EvalState = struct {
     eq_seen: std.AutoHashMap(u64, void) = undefined,
     /// JSON serialisation depth (guards against cyclic structures)
     json_depth: usize = 0,
+    /// Enabled experimental features (e.g. "pipe-operators", "extra-builtins")
+    features: std.StringHashMap(void) = undefined,
+    /// `--impure` mode: absolute paths may be read/copied, currentSystem and
+    /// the environment are visible (like `nix eval --impure`).
+    impure: bool = false,
+    /// Active `filterSource` predicate value (path: type: bool).
+    filter_fn: value.Value = .null_,
+    /// When true, descend into lambda bodies during the definedness walk
+    /// (default false: conservative, avoids false positives in nixpkgs).
+    checkDefinedBody: bool = false,
     /// temp dir where embedded corepkgs (`nix/fetchurl.nix`) are materialised
     corepkgs_dir: []const u8 = "/tmp",
     /// error trace: innermost positions first (for Nix-style traces)
@@ -79,6 +89,17 @@ pub const EvalState = struct {
     environ: ?*const std.process.Environ.Map = null,
 
     pub fn init(alloc: std.mem.Allocator, store_dir: []const u8, read_only: bool, home_dir: []const u8) !*EvalState {
+        return initFull(alloc, store_dir, read_only, home_dir, &.{}, false);
+    }
+
+    /// Like init, with a list of enabled experimental features (e.g.
+    /// "pipe-operators", "extra-builtins").
+    pub fn initFeatures(alloc: std.mem.Allocator, store_dir: []const u8, read_only: bool, home_dir: []const u8, features: []const []const u8) !*EvalState {
+        return initFull(alloc, store_dir, read_only, home_dir, features, false);
+    }
+
+    /// Full initializer: experimental features plus `--impure` mode.
+    pub fn initFull(alloc: std.mem.Allocator, store_dir: []const u8, read_only: bool, home_dir: []const u8, features: []const []const u8, impure: bool) !*EvalState {
         const st = try alloc.create(EvalState);
         st.* = .{
             .alloc = alloc,
@@ -93,7 +114,10 @@ pub const EvalState = struct {
             .eval_chain = std.array_list.Managed(ast.Pos).init(alloc),
             .eq_seen = std.AutoHashMap(u64, void).init(alloc),
             .json_depth = 0,
+            .features = std.StringHashMap(void).init(alloc),
+            .impure = impure,
         };
+        for (features) |f| st.features.put(f, {}) catch return error.OutOfMemory;
         // builtins + base env (mutually recursive construction)
         const b = try builtins.makeBuiltins(st);
         st.builtins_attrs = b.attrs;
@@ -124,7 +148,64 @@ pub const EvalState = struct {
     // Values
     // ------------------------------------------------------------------
 
+    /// Shallow definedness check: verify direct variable references and the
+    /// immediate structure (lists, operators, selects) without descending into
+    /// lambda bodies or `with` bodies.  Never forces anything.
+    fn checkDefinedShallow(self: *EvalState, expr: *const ast.Expr, env: *Env) EvalError!void {
+        switch (expr.kind) {
+            .var_ref => |name| {
+                var e: ?*Env = env;
+                var any_with = false;
+                while (e) |env_frame| {
+                    if (env_frame.with != null) any_with = true;
+                    for (env_frame.vars) |v| {
+                        if (std.mem.eql(u8, v.name, name)) return;
+                    }
+                    e = env_frame.parent;
+                }
+                if (!any_with) return self.userError("undefined variable '{s}'", .{name});
+            },
+            .list => |items| {
+                for (items) |it| try self.checkDefinedShallow(it, env);
+            },
+            .op => |op| {
+                try self.checkDefinedShallow(op.left, env);
+                try self.checkDefinedShallow(op.right, env);
+            },
+            .concat => |c| {
+                for (c.parts) |p| try self.checkDefinedShallow(p, env);
+            },
+            .str => |s2| {
+                for (s2.parts) |p| {
+                    if (p == .interp) try self.checkDefinedShallow(p.interp, env);
+                }
+            },
+            .select => |sel| {
+                try self.checkDefinedShallow(sel.base, env);
+                if (sel.default) |d| try self.checkDefinedShallow(d, env);
+            },
+            .not_ => |e2| try self.checkDefinedShallow(e2, env),
+            .if_ => |i| {
+                try self.checkDefinedShallow(i.cond, env);
+                try self.checkDefinedShallow(i.then, env);
+                try self.checkDefinedShallow(i.else_, env);
+            },
+            .assert_ => |a2| {
+                try self.checkDefinedShallow(a2.cond, env);
+                try self.checkDefinedShallow(a2.body, env);
+            },
+            else => {},
+        }
+    }
+
     pub fn mkThunk(self: *EvalState, expr: *ast.Expr, env: *Env, pos: usize) EvalError!Value {
+        // Nix resolves variable references eagerly at thunk creation: an
+        // undefined variable is an error even if the thunk is never forced
+        // (`let a = x; in 1` fails).  The value itself stays lazy.  Only
+        // direct variable references (and top-level structure) are checked;
+        // lambda bodies and `with` bodies are resolved lazily to avoid false
+        // positives on nixpkgs' self-referential structures.
+        try self.checkDefinedShallow(expr, env);
         const t = try self.alloc.create(value.Thunk);
         const st = try self.alloc.create(value.ThunkState);
         st.* = .{};
@@ -189,6 +270,7 @@ pub const EvalState = struct {
 
                     switch (t.state.phase) {
                         .evaluating => {
+                            std.debug.print("DBG IR thunk expr={s} pos=«{s}»:{d}\n", .{ @tagName(t.expr.kind), t.expr.pos.file, t.expr.pos.line });
                             return error.InfiniteRecursion;
                         },
                         .done => {
@@ -228,6 +310,27 @@ pub const EvalState = struct {
     // ------------------------------------------------------------------
     // Environment lookup
     // ------------------------------------------------------------------
+
+    /// Invoke the active filterSource predicate: `filter path type`.
+    pub fn filterCheck(self: *EvalState, path: []const u8, kind: []const u8) bool {
+        const res = self.applyFilter(self.filter_fn, path, kind) catch return false;
+        var v = res;
+        self.force(&v) catch return false;
+        return v == .bool_ and v.bool_;
+    }
+
+    fn applyFilter(self: *EvalState, f: value.Value, path: []const u8, kind: []const u8) EvalError!Value {
+        const arg1 = try self.alloc.create(Value);
+        arg1.* = self.mkString(path, &.{});
+        const r1 = try self.apply(f, arg1, 0);
+        const arg2 = try self.alloc.create(Value);
+        arg2.* = self.mkString(kind, &.{});
+        return self.apply(r1, arg2, 0);
+    }
+
+    pub fn hasFeature(self: *const EvalState, name: []const u8) bool {
+        return self.features.contains(name);
+    }
 
     pub fn lookup(self: *EvalState, env: *Env, name: []const u8) EvalError!*Value {
         // Nix resolves variables statically: lexical bindings always take
@@ -309,7 +412,7 @@ pub const EvalState = struct {
                         .lit => |lit| try out.appendSlice(lit),
                         .interp => |e| {
                             var v = try self.evalAndForce(e, env, pos);
-                            const t = try self.coerceToString(&v, &ctx, false, false, "while evaluating a path segment");
+                            const t = try self.coerceToString(&v, &ctx, true, false, "while evaluating a path segment");
                             try out.appendSlice(t);
                         },
                     }
@@ -497,10 +600,7 @@ pub const EvalState = struct {
                 const out = try self.alloc.alloc(*Value, elems.len);
                 for (elems, 0..) |e, i| {
                     out[i] = try self.alloc.create(Value);
-                    // Evaluate the element expression like Nix: operators and
-                    // variables are checked eagerly (undefined variables
-                    // error), while calls stay lazy (builtins run on force).
-                    out[i].* = try self.eval(e, env, pos);
+                    out[i].* = try self.mkThunk(e, env, pos);
                 }
                 return .{ .list = out };
             },
@@ -807,24 +907,20 @@ pub const EvalState = struct {
         var float_sum: f64 = 0;
         var out = std.array_list.Managed(u8).init(self.alloc);
         var ctx = std.array_list.Managed(value.CtxElem).init(self.alloc);
+        var parts_val = std.array_list.Managed(*Value).init(self.alloc);
         for (parts) |p| {
-            var v = try self.evalAndForce(p, env, pos);
-            if (first_type == null) {
-                first_type = std.meta.activeTag(v);
-                switch (v) {
-                    .int => |i| {
-                        int_sum = i;
-                        continue;
-                    },
-                    .float => |f| {
-                        float_sum = f;
-                        continue;
-                    },
-                    else => {},
-                }
-            }
+            const v = try self.alloc.create(Value);
+            v.* = try self.evalAndForce(p, env, pos);
+            try parts_val.append(v);
+            if (first_type == null) first_type = std.meta.activeTag(v.*);
+        }
+        // Nix: only when the first part is a *string* are later paths copied
+        // to the store (copyToStore = firstType == nString).  A leading path
+        // means no copying at all.
+        const copy_to_store = first_type.? == .string;
+        for (parts_val.items) |v| {
             switch (first_type.?) {
-                .int => switch (v) {
+                .int => switch (v.*) {
                     .int => |i| {
                         int_sum = std.math.add(i64, int_sum, i) catch {
                             return self.userError("integer overflow in adding {d} + {d}", .{ int_sum, i });
@@ -834,15 +930,15 @@ pub const EvalState = struct {
                         float_sum = @as(f64, @floatFromInt(int_sum)) + f;
                         first_type = .float;
                     },
-                    else => return self.userError("cannot add {s} to an integer", .{showType(v)}),
+                    else => return self.userError("cannot add {s} to an integer", .{showType(v.*)}),
                 },
-                .float => switch (v) {
+                .float => switch (v.*) {
                     .int => |i| float_sum += @floatFromInt(i),
                     .float => |f| float_sum += f,
-                    else => return self.userError("cannot add {s} to a float", .{showType(v)}),
+                    else => return self.userError("cannot add {s} to a float", .{showType(v.*)}),
                 },
                 else => {
-                    const s = try self.coerceToString(&v, &ctx, false, false, "while evaluating a path segment");
+                    const s = try self.coerceToString(v, &ctx, copy_to_store, false, "while evaluating a path segment");
                     try out.appendSlice(s);
                 },
             }
@@ -872,6 +968,9 @@ pub const EvalState = struct {
             },
             .path => |p| {
                 if (copy_to_store) {
+                    if (!self.impure) {
+                        return self.userError("access to absolute path '{s}' is forbidden in pure evaluation mode (use '--impure' to override)", .{p.p});
+                    }
                     const sp = try self.copyPathToStore(p.p);
                     try ctx.append(.{ .kind = .opaq, .path = sp });
                     return sp;
@@ -918,6 +1017,12 @@ pub const EvalState = struct {
     }
 
     pub fn coerceToPlainString(self: *EvalState, v: *Value, err_ctx: []const u8) EvalError![]const u8 {
+        try self.force(v);
+        // Nix rejects paths where a plain string is required (e.g. dynamic
+        // attribute names).
+        if (v.* == .path) {
+            return self.userError("expected a string but found a path: {s}", .{v.path.p});
+        }
         var ctx = std.array_list.Managed(value.CtxElem).init(self.alloc);
         return self.coerceToString(v, &ctx, false, false, err_ctx);
     }
@@ -1086,11 +1191,21 @@ pub const EvalState = struct {
         const dirname = std.fs.path.dirname(file) orelse "";
         const base_dir = if (dirname.len > 0) dirname else ".";
         var p = parser.Parser.init(self.alloc, toks, base_dir, self.home_dir);
+        p.pipe_ok = self.hasFeature("pipe-operators");
         p.file = file;
         return p.parse() catch |e| {
             const pos = p.curPos();
             return self.userError("parse error in '{s}': {s} at «{s}»:{d}:{d}", .{ file, @errorName(e), file, pos.line, pos.col });
         };
+    }
+
+    /// Copy a filesystem path into the store with a filter predicate
+    /// (`builtins.filterSource`).
+    pub fn copyPathToStoreFiltered(self: *EvalState, name: []const u8, p: []const u8, filter_val: Value) EvalError![]const u8 {
+        const sp = store.addPathToStoreFiltered(&self.store, name, p, filter_val, self) catch |e| {
+            return self.userError("cannot copy '{s}' to the store: {s}", .{ p, @errorName(e) });
+        };
+        return sp;
     }
 
     /// Copy a filesystem path into the store (recursive sha256).

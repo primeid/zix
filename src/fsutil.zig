@@ -15,6 +15,17 @@ pub const Stat = struct {
     size: u64,
 };
 
+/// Returns "regular", "directory", "symlink" or null (like `builtins.readFileType`).
+pub fn pathType(path: []const u8) ?[]const u8 {
+    const st = statPath(path) catch return null;
+    return switch (st.kind) {
+        .file => "regular",
+        .directory => "directory",
+        .symlink => "symlink",
+        else => null,
+    };
+}
+
 pub fn statPath(path: []const u8) !Stat {
     // Check symlink first (statFile follows links).
     var buf: [std.fs.max_path_bytes]u8 = undefined;

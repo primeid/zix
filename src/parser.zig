@@ -9,6 +9,7 @@ const Token = lexer.Token;
 const TokenKind = lexer.TokenKind;
 
 pub const ParseError = error{
+    PipeDisabled,
     OutOfMemory,
     UnexpectedToken,
     ExpectedToken,
@@ -27,6 +28,9 @@ pub const Parser = struct {
     base_dir: []const u8,
     home_dir: []const u8,
     file: []const u8 = "",
+    /// `|>` / `<|` operators are only parsed with the `pipe-operators`
+    /// experimental feature enabled (like Nix).
+    pipe_ok: bool = false,
 
     pub fn init(alloc: std.mem.Allocator, toks: []const Token, base_dir: []const u8, home_dir: []const u8) Parser {
         return .{ .alloc = alloc, .toks = toks, .base_dir = base_dir, .home_dir = home_dir };
@@ -162,6 +166,9 @@ pub const Parser = struct {
         var e = try self.parseOpExpr();
         while (true) {
             const t = self.peek();
+            if ((t.kind == .pipe_from or t.kind == .pipe_into) and !self.pipe_ok) {
+                return error.PipeDisabled;
+            }
             if (t.kind == .pipe_from) {
                 // f <| x  ==  f x
                 _ = self.advance();

@@ -8,7 +8,11 @@ const value = @import("value.zig");
 const builtins = @import("builtins.zig");
 
 fn newState(alloc: std.mem.Allocator) !*eval.EvalState {
-    return eval.EvalState.init(alloc, "/nix/store", true, "/home/user");
+    return newStateFeat(alloc, &.{});
+}
+
+fn newStateFeat(alloc: std.mem.Allocator, features: []const []const u8) !*eval.EvalState {
+    return eval.EvalState.initFeatures(alloc, "/nix/store", true, "/home/user", features);
 }
 
 fn evalStr(alloc: std.mem.Allocator, src: []const u8) !value.Value {
@@ -156,6 +160,20 @@ fn evalOnBigStack(st: *eval.EvalState, parsed: *const ast.Expr, ok: *bool, err: 
     ok.* = true;
 }
 
+fn expectEvalFeat(alloc: std.mem.Allocator, src: []const u8, expected: []const u8, feature: []const u8) !void {
+    const st = try newStateFeat(alloc, &.{feature});
+    defer st.deinit();
+    const parsed = try st.parse(src, "<test>");
+    var v = try st.eval(parsed, st.base_env, 0);
+    var w = std.array_list.Managed(u8).init(alloc);
+    try printTest(st, &v, &w, 0);
+    const out = try w.toOwnedSlice();
+    if (!std.mem.eql(u8, out, expected)) {
+        std.debug.print("eval mismatch:\n  expr:     {s}\n  expected: {s}\n  got:      {s}\n", .{ src, expected, out });
+        return error.TestExpectedEqual;
+    }
+}
+
 fn expectEvalErr(alloc: std.mem.Allocator, src: []const u8, needle: []const u8) !void {
     const st = try newState(alloc);
     defer st.deinit();
@@ -251,8 +269,8 @@ test "eval: builtins" {
     try expectEval(a, "builtins.isFunction (x: x)", "true");
     try expectEval(a, "builtins.substring 1 3 \"hello\"", "ell");
     try expectEval(a, "builtins.stringLength \"hello\"", "5");
-    try expectEval(a, "builtins.toUpper \"abc\"", "ABC");
-    try expectEval(a, "builtins.toLower \"ABC\"", "abc");
+    try expectEvalFeat(a, "builtins.toUpper \"abc\"", "ABC", "extra-builtins");
+    try expectEvalFeat(a, "builtins.toLower \"ABC\"", "abc", "extra-builtins");
     try expectEval(a, "builtins.concatStringsSep \",\" [\"a\" \"b\" \"c\"]", "a,b,c");
     try expectEval(a, "builtins.replaceStrings [\"a\"] [\"b\"] \"aaa\"", "bbb");
     try expectEval(a, "builtins.splitVersion \"1.2.3pre\"", "[ 1 2 3 pre ]");
@@ -316,7 +334,7 @@ test "eval: nixpkgs-compat regressions" {
     // builtins.mapAttrs
     try expectEval(a, "builtins.mapAttrs (n: v: v * 2) { a = 1; b = 2; }", "{ a = 2; b = 4; }");
     // builtins.mapAttrs'
-    try expectEval(a, "builtins.mapAttrs' (n: v: { name = n + \"x\"; value = v; }) { a = 1; }", "{ ax = 1; }");
+    try expectEvalFeat(a, "builtins.mapAttrs' (n: v: { name = n + \"x\"; value = v; }) { a = 1; }", "{ ax = 1; }", "extra-builtins");
 }
 
 test "eval: positions (__curPos, unsafeGetAttrPos)" {

@@ -445,11 +445,12 @@ pub const Lexer = struct {
         const dot = std.mem.indexOfScalar(u8, mant, '.') orelse return false;
         const int_part = mant[0..dot];
         const frac_part = mant[dot + 1 ..];
-        if (frac_part.len == 0) return false;
-        // `0?\.[0-9]+`: a single leading zero (or no integer part) is allowed.
-        if (int_part.len == 0) return true;
-        if (int_part.len == 1 and int_part[0] == '0') return true;
-        // `[1-9][0-9]*\.[0-9]*`: must not have a leading zero.
+        // `0?\.[0-9]+`: a single leading zero (or no integer part) requires
+        // at least one fraction digit (`0.` is invalid, `.` alone is invalid).
+        if (int_part.len == 0 or (int_part.len == 1 and int_part[0] == '0')) {
+            return frac_part.len > 0;
+        }
+        // `[1-9][0-9]*\.[0-9]*`: trailing-dot floats are allowed (`10.` = 10).
         if (int_part[0] < '1' or int_part[0] > '9') return false;
         return true;
     }

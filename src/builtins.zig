@@ -97,8 +97,16 @@ pub fn makeBuiltins(st: *Eval) !Init {
         fn add(list: *std.array_list.Managed(value.Item), st2: *Eval, name: []const u8, arity: usize, f: anytype) !void {
             const v = try st2.alloc.create(Value);
             if (arity == 0) {
-                // constant builtins (langVersion, storeDir, ...) evaluate eagerly
-                v.* = try f(st2, &.{}, 0);
+                // Constant builtins (langVersion, storeDir, currentSystem, ...)
+                // evaluate lazily: they may fail in pure mode, and evaluation
+                // must happen at use, not at init.
+                const b = try st2.alloc.create(value.Builtin);
+                b.* = .{ .name = name, .arity = 0, .f = f };
+                const t = try st2.alloc.create(value.Thunk);
+                const ts = try st2.alloc.create(value.ThunkState);
+                ts.* = .{};
+                t.* = .{ .expr = undefined, .env = undefined, .state = ts, .pos = 0, .builtin = b.* };
+                v.* = .{ .thunk = t };
             } else {
                 const b = try st2.alloc.create(value.Builtin);
                 b.* = .{ .name = name, .arity = arity, .f = f };
@@ -136,7 +144,9 @@ pub fn makeBuiltins(st: *Eval) !Init {
     try B.add(&items, st, "bitAnd", 2, primBitAnd);
     try B.add(&items, st, "bitOr", 2, primBitOr);
     try B.add(&items, st, "bitXor", 2, primBitXor);
-    try B.add(&items, st, "bitNot", 1, primBitNot);
+    if (st.hasFeature("extra-builtins")) {
+        try B.add(&items, st, "bitNot", 1, primBitNot);
+    }
     try B.add(&items, st, "toString", 1, primToString);
     try B.add(&items, st, "toJSON", 1, primToJSON);
     try B.add(&items, st, "toXML", 1, primToXML);
@@ -144,7 +154,9 @@ pub fn makeBuiltins(st: *Eval) !Init {
     try B.add(&items, st, "fromTOML", 1, primFromTOML);
     try B.add(&items, st, "map", 2, primMap);
     try B.add(&items, st, "mapAttrs", 2, primMapAttrs);
-    try B.add(&items, st, "mapAttrs'", 2, primMapAttrsPrime);
+    if (st.hasFeature("extra-builtins")) {
+        try B.add(&items, st, "mapAttrs'", 2, primMapAttrsPrime);
+    }
     try B.add(&items, st, "toPath", 1, primToPath);
     try B.add(&items, st, "addDrvOutputDependencies", 1, primAddDrvOutputDependencies);
     try B.add(&items, st, "filter", 2, primFilter);
@@ -159,9 +171,11 @@ pub fn makeBuiltins(st: *Eval) !Init {
     try B.add(&items, st, "concatMap", 2, primConcatMap);
     try B.add(&items, st, "all", 2, primAll);
     try B.add(&items, st, "any", 2, primAny);
-    try B.add(&items, st, "take", 2, primTake);
-    try B.add(&items, st, "drop", 2, primDrop);
-    try B.add(&items, st, "reverseList", 1, primReverseList);
+    if (st.hasFeature("extra-builtins")) {
+        try B.add(&items, st, "take", 2, primTake);
+        try B.add(&items, st, "drop", 2, primDrop);
+        try B.add(&items, st, "reverseList", 1, primReverseList);
+    }
     try B.add(&items, st, "sort", 2, primSort);
     try B.add(&items, st, "partition", 2, primPartition);
     try B.add(&items, st, "groupBy", 2, primGroupBy);
@@ -187,8 +201,10 @@ pub fn makeBuiltins(st: *Eval) !Init {
     try B.add(&items, st, "typeOf", 1, primTypeOf);
     try B.add(&items, st, "stringLength", 1, primStringLength);
     try B.add(&items, st, "substring", 3, primSubstring);
-    try B.add(&items, st, "toUpper", 1, primToUpper);
-    try B.add(&items, st, "toLower", 1, primToLower);
+    if (st.hasFeature("extra-builtins")) {
+        try B.add(&items, st, "toUpper", 1, primToUpper);
+        try B.add(&items, st, "toLower", 1, primToLower);
+    }
     try B.add(&items, st, "replaceStrings", 3, primReplaceStrings);
     try B.add(&items, st, "concatStringsSep", 2, primConcatStringsSep);
     try B.add(&items, st, "split", 2, primSplit);
@@ -227,6 +243,14 @@ pub fn makeBuiltins(st: *Eval) !Init {
     try B.add(&items, st, "storeDir", 0, primStoreDir);
     try B.add(&items, st, "nixPath", 0, primNixPath);
     try B.add(&items, st, "getContext", 1, primGetContext);
+    try B.add(&items, st, "hasContext", 1, primHasContext);
+    try B.add(&items, st, "ceil", 1, primCeil);
+    try B.add(&items, st, "floor", 1, primFloor);
+    try B.add(&items, st, "readFileType", 1, primReadFileType);
+    try B.add(&items, st, "warn", 2, primWarn);
+    try B.add(&items, st, "traceVerbose", 2, primTraceVerbose);
+    try B.add(&items, st, "convertHash", 1, primConvertHash);
+    try B.add(&items, st, "filterSource", 2, primFilterSource);
     try B.add(&items, st, "appendContext", 2, primAppendContext);
 
     const builtins_attrs = try st.alloc.create(value.Attrs);
@@ -914,6 +938,8 @@ fn primUnsafeGetAttrPos(st: *Eval, args: []const *Value, pos: usize) EvalError!V
     }
     const it = item orelse return .null_;
     if (it.pos.line == 0) return .null_;
+    // Command-line expressions have no real source positions (like Nix).
+    if (std.mem.endsWith(u8, it.pos.file, "<command-line>")) return .null_;
     const items = try st.alloc.alloc(value.Item, 3);
     const col_v = try st.alloc.create(Value);
     col_v.* = .{ .int = it.pos.col };
@@ -1310,11 +1336,22 @@ fn primBaseNameOf(st: *Eval, args: []const *Value, pos: usize) EvalError!Value {
 fn primDirOf(st: *Eval, args: []const *Value, pos: usize) EvalError!Value {
     _ = pos;
 
+    var v = args[0].*;
+    try st.force(&v);
     var ctx = std.array_list.Managed(value.CtxElem).init(st.alloc);
-    const s = try forceStringWithCtx(st, args[0], &ctx, false, "while evaluating the argument to builtins.dirOf");
-    const dir = std.fs.path.dirname(s) orelse ".";
-    // Nix returns a path (printed without quotes), not a string.
-    return .{ .path = .{ .p = try st.alloc.dupe(u8, dir), .ctx = ctx.items } };
+    // Nix preserves the input type: a path argument yields a path, a string
+    // (possibly with store context) yields a string.
+    switch (v) {
+        .path => |p| {
+            const dir = std.fs.path.dirname(p.p) orelse ".";
+            return .{ .path = .{ .p = try st.alloc.dupe(u8, dir), .ctx = ctx.items } };
+        },
+        else => {
+            const s = try forceStringWithCtx(st, args[0], &ctx, false, "while evaluating the argument to builtins.dirOf");
+            const dir = std.fs.path.dirname(s) orelse ".";
+            return st.mkString(try st.alloc.dupe(u8, dir), ctx.items);
+        },
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1344,6 +1381,7 @@ fn primReadFile(st: *Eval, args: []const *Value, pos: usize) EvalError!Value {
 
 fn primReadDir(st: *Eval, args: []const *Value, pos: usize) EvalError!Value {
     _ = pos;
+    if (!st.impure) return st.userError("access to absolute path is forbidden in pure evaluation mode (use '--impure' to override)", .{});
 
     var v = args[0].*;
     try st.force(&v);
@@ -1567,6 +1605,9 @@ fn primStorePath(st: *Eval, args: []const *Value, pos: usize) EvalError!Value {
     if (!st.store.isInStore(p)) {
         return st.userError("path '{s}' is not in the Nix store", .{p});
     }
+    if (!fsutil.pathExists(p)) {
+        return st.userError("path '{s}' is required, but there is no substitute", .{p});
+    }
     var ctx = std.array_list.Managed(value.CtxElem).init(st.alloc);
     try ctx.append(.{ .kind = .opaq, .path = p });
     return st.mkString(p, ctx.items);
@@ -1574,6 +1615,8 @@ fn primStorePath(st: *Eval, args: []const *Value, pos: usize) EvalError!Value {
 
 fn primGetEnv(st: *Eval, args: []const *Value, pos: usize) EvalError!Value {
     _ = pos;
+    // In pure mode the environment is hidden (like Nix).
+    if (!st.impure) return st.mkString("", &.{});
 
     const name = try forceStringNoCtx(st, args[0], "");
     const val = if (st.environ) |env| env.get(name) orelse "" else "";
@@ -1581,6 +1624,9 @@ fn primGetEnv(st: *Eval, args: []const *Value, pos: usize) EvalError!Value {
 }
 
 fn primCurrentSystem(st: *Eval, args: []const *Value, pos: usize) EvalError!Value {
+    if (!st.impure) {
+        return st.userError("attribute 'currentSystem' missing", .{});
+    }
     _ = args;
     _ = pos;
 
@@ -1621,6 +1667,7 @@ fn primStoreDir(st: *Eval, args: []const *Value, pos: usize) EvalError!Value {
 }
 
 fn primNixPath(st: *Eval, args: []const *Value, pos: usize) EvalError!Value {
+    if (!st.impure) return .{ .list = &.{} };
     _ = args;
     _ = pos;
 
@@ -1637,6 +1684,141 @@ fn primNixPath(st: *Eval, args: []const *Value, pos: usize) EvalError!Value {
         out[i].* = try st.mkAttrs(items);
     }
     return .{ .list = out };
+}
+
+fn primHasContext(st: *Eval, args: []const *Value, pos: usize) EvalError!Value {
+    _ = pos;
+    var v = args[0].*;
+    try st.force(&v);
+    const ctx: []const value.CtxElem = switch (v) {
+        .string => |s| s.ctx,
+        .path => |p| p.ctx,
+        else => return st.userError("'hasContext' called on {s}, expected a string", .{eval.EvalState.showType(v)}),
+    };
+    return .{ .bool_ = ctx.len > 0 };
+}
+
+fn primCeil(st: *Eval, args: []const *Value, pos: usize) EvalError!Value {
+    _ = pos;
+    var v = args[0].*;
+    try st.force(&v);
+    const f: f64 = switch (v) {
+        .float => |fv| fv,
+        .int => |i| @floatFromInt(i),
+        else => return st.userError("'ceil' called on {s}, expected a float", .{eval.EvalState.showType(v)}),
+    };
+    return .{ .int = @intFromFloat(@ceil(f)) };
+}
+
+fn primFloor(st: *Eval, args: []const *Value, pos: usize) EvalError!Value {
+    _ = pos;
+    var v = args[0].*;
+    try st.force(&v);
+    const f: f64 = switch (v) {
+        .float => |fv| fv,
+        .int => |i| @floatFromInt(i),
+        else => return st.userError("'floor' called on {s}, expected a float", .{eval.EvalState.showType(v)}),
+    };
+    return .{ .int = @intFromFloat(@floor(f)) };
+}
+
+fn primReadFileType(st: *Eval, args: []const *Value, pos: usize) EvalError!Value {
+    _ = pos;
+    var v = args[0].*;
+    try st.force(&v);
+    const p: []const u8 = switch (v) {
+        .path => |p| p.p,
+        .string => |s| s.s,
+        else => return st.userError("'readFileType' called on {s}, expected a path", .{eval.EvalState.showType(v)}),
+    };
+    const ty = fsutil.pathType(p) orelse return .null_;
+    return st.mkString(ty, &.{});
+}
+
+fn primWarn(st: *Eval, args: []const *Value, pos: usize) EvalError!Value {
+    _ = pos;
+    const msg = try forceStringNoCtx(st, args[0], "while evaluating the first argument to builtins.warn");
+    std.debug.print("warning: {s}\n", .{msg});
+    return args[1].*;
+}
+
+fn primTraceVerbose(st: *Eval, args: []const *Value, pos: usize) EvalError!Value {
+    _ = pos;
+    _ = try forceStringNoCtx(st, args[0], "while evaluating the first argument to builtins.traceVerbose");
+    return args[1].*;
+}
+
+fn primConvertHash(st: *Eval, args: []const *Value, pos: usize) EvalError!Value {
+    _ = pos;
+    // Nix 2.34 signature: convertHash { hash, hashAlgo?, toHashFormat }.
+    var av = args[0].*;
+    try st.force(&av);
+    if (av != .attrs) return st.userError("'convertHash' called on {s}, expected a set", .{eval.EvalState.showType(av)});
+    const h_v = av.attrs.find("hash") orelse return st.userError("attribute 'hash' missing", .{});
+    var hv = h_v.*;
+    try st.force(&hv);
+    const h: []const u8 = switch (hv) {
+        .string => |s| s.s,
+        else => return st.userError("'hash' is {s}, expected a string", .{eval.EvalState.showType(hv)}),
+    };
+    // Nix requires the algorithm so it can parse the input hash.
+    const algo_v = av.attrs.find("hashAlgo") orelse return st.userError("attribute 'hashAlgo' missing", .{});
+    var algov = algo_v.*;
+    try st.force(&algov);
+    const algo = try forceStringNoCtx(st, &algov, "while evaluating the attribute 'hashAlgo'");
+    if (!std.mem.eql(u8, algo, "sha256")) return st.userError("unsupported hash algorithm '{s}'", .{algo});
+    const fmt_v = av.attrs.find("toHashFormat") orelse return st.userError("attribute 'toHashFormat' missing", .{});
+    var fmtv = fmt_v.*;
+    try st.force(&fmtv);
+    const to_format = try forceStringNoCtx(st, &fmtv, "while evaluating the attribute 'toHashFormat'");
+    if (std.mem.eql(u8, to_format, "base16")) {
+        if (h.len == 52) {
+            const bytes = nixhash.nix32Decode(st.alloc, h) catch return st.userError("invalid nix32 hash '{s}'", .{h});
+            var hex: [70]u8 = undefined;
+            return st.mkString(try st.alloc.dupe(u8, nixhash.base16Encode(&hex, bytes)), &.{});
+        }
+        if (h.len == 64) return st.mkString(try st.alloc.dupe(u8, h), &.{});
+        return st.userError("cannot convert hash '{s}'", .{h});
+    }
+    if (std.mem.eql(u8, to_format, "base32") or std.mem.eql(u8, to_format, "nix32")) {
+        if (h.len == 64) {
+            const bytes = nixhash.base16Decode(st.alloc, h) catch return st.userError("invalid base16 hash '{s}'", .{h});
+            var b32buf: [64]u8 = undefined;
+            return st.mkString(try st.alloc.dupe(u8, nixhash.nix32Encode(bytes, &b32buf)), &.{});
+        }
+        if (h.len == 52) return st.mkString(try st.alloc.dupe(u8, h), &.{});
+        return st.userError("cannot convert hash '{s}'", .{h});
+    }
+    return st.userError("unknown hash format '{s}'", .{to_format});
+}
+
+fn primFilterSource(st: *Eval, args: []const *Value, pos: usize) EvalError!Value {
+    _ = pos;
+    var fv = args[0].*;
+    try st.force(&fv);
+    var pv = args[1].*;
+    try st.force(&pv);
+    const p: []const u8 = switch (pv) {
+        .path => |p| p.p,
+        else => return st.userError("'filterSource' called on {s}, expected a path", .{eval.EvalState.showType(pv)}),
+    };
+    const name = std.fs.path.basename(p);
+    if (!st.impure) {
+        return st.userError("access to absolute path '{s}' is forbidden in pure evaluation mode (use '--impure' to override)", .{p});
+    }
+    st.filter_fn = fv;
+    const sp = store.addPathToStoreFiltered(&st.store, name, p, .{
+        .st = st,
+        .filterCheck = struct {
+            fn f(ctx: *anyopaque, p2: []const u8, kind: []const u8) bool {
+                const es: *Eval = @ptrCast(@alignCast(ctx));
+                return es.filterCheck(p2, kind);
+            }
+        }.f,
+    }) catch |e| {
+        return st.userError("cannot copy '{s}' to the store: {s}", .{ p, @errorName(e) });
+    };
+    return st.mkString(try st.alloc.dupe(u8, sp), &.{});
 }
 
 fn primGetContext(st: *Eval, args: []const *Value, pos: usize) EvalError!Value {

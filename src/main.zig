@@ -30,9 +30,12 @@ pub fn main(init: std.process.Init) !void {
     var mode: enum { eval, parse, build } = .eval;
     var expr_mode = false;
     var raw = false;
+    var json = false;
     var read_only = false;
     var store_dir: []const u8 = init.environ_map.get("ZIX_STORE_DIR") orelse "/nix/store";
     var nix_path_extra = std.array_list.Managed([]const u8).init(a);
+    var cli_args = std.array_list.Managed(ArgPair).init(a); // --arg/--argstr
+    var attr_path: ?[]const u8 = null; // -A
 
     var i: usize = 1;
     while (i < argv.items.len) : (i += 1) {
@@ -59,6 +62,24 @@ pub fn main(init: std.process.Init) !void {
                 std.process.exit(1);
             }
             try nix_path_extra.append(argv.items[i]);
+        } else if (std.mem.eql(u8, arg, "--json")) {
+            json = true;
+        } else if (std.mem.eql(u8, arg, "-A")) {
+            i += 1;
+            if (i >= argv.items.len) {
+                std.debug.print("zix: missing argument for -A\n", .{});
+                std.process.exit(1);
+            }
+            attr_path = argv.items[i];
+        } else if (std.mem.eql(u8, arg, "--arg") or std.mem.eql(u8, arg, "--argstr")) {
+            const is_str = std.mem.eql(u8, arg, "--argstr");
+            i += 1;
+            if (i + 1 >= argv.items.len) {
+                std.debug.print("zix: missing arguments for {s}\n", .{arg});
+                std.process.exit(1);
+            }
+            try cli_args.append(.{ .name = argv.items[i], .value = argv.items[i + 1], .is_str = is_str });
+            i += 1;
         } else if (std.mem.eql(u8, arg, "parse")) {
             mode = .parse;
         } else if (std.mem.eql(u8, arg, "build")) {
@@ -105,12 +126,50 @@ pub fn main(init: std.process.Init) !void {
         parsed: *const zix.ast.Expr,
         output: *std.array_list.Managed(u8),
         raw: bool,
+        json: bool,
+        cli_args: []const ArgPair,
+        apply_args: bool,
+        attr_path: ?[]const u8,
     };
     // Evaluate AND print on a thread with a large stack: deep forcing of
     // the (lazy) result must not overflow the small main-thread stack.
     const run_eval = struct {
         fn f(ctx: RunCtx) void {
             var result = ctx.st.eval(ctx.parsed, ctx.st.base_env, 0) catch |e| exitEvalError(e, ctx.st);
+            // --arg/--argstr: apply the args to the (function) expression.
+            if (ctx.cli_args.len > 0 and ctx.apply_args) {
+                const argset = makeCliArgset(ctx.st, ctx.cli_args) catch |e| exitEvalError(e, ctx.st);
+                result = ctx.st.apply(result, argset, 0) catch |e| exitEvalError(e, ctx.st);
+            }
+            // -A attr-path: select the attribute path.
+            if (ctx.attr_path) |ap| {
+                var cur = result;
+                var it = std.mem.tokenizeScalar(u8, ap, '.');
+                while (it.next()) |name| {
+                    ctx.st.force(&cur) catch |e| exitEvalError(e, ctx.st);
+                    if (cur != .attrs) {
+                        std.debug.print("zix: attribute '{s}' missing (cannot select from {s})\n", .{ name, eval.EvalState.showType(cur) });
+                        std.process.exit(1);
+                    }
+                    const found = cur.attrs.find(name) orelse {
+                        std.debug.print("zix: attribute '{s}' missing\n", .{name});
+                        std.process.exit(1);
+                    };
+                    cur = found.*;
+                }
+                result = cur;
+            }
+            if (ctx.json) {
+                zix.builtins.jsonWritePub(ctx.st, &result, ctx.output) catch |e| {
+                    if (ctx.st.err_msg.len > 0) {
+                        std.debug.print("zix: error printing value: {s}\n", .{ctx.st.err_msg});
+                    } else {
+                        std.debug.print("zix: error printing value: {s}\n", .{@errorName(e)});
+                    }
+                    std.process.exit(1);
+                };
+                return;
+            }
             printValue(ctx.st, &result, ctx.output, 0, ctx.raw) catch |e| {
                 if (ctx.st.err_msg.len > 0) {
                     std.debug.print("zix: error printing value: {s}\n", .{ctx.st.err_msg});
@@ -136,12 +195,12 @@ pub fn main(init: std.process.Init) !void {
             }
             std.process.exit(1);
         };
-        const t = try std.Thread.spawn(.{ .stack_size = 1 << 30 }, run_eval, .{ RunCtx{ .st = st, .parsed = parsed, .output = &output, .raw = raw } });
+        const t = try std.Thread.spawn(.{ .stack_size = 1 << 30 }, run_eval, .{ RunCtx{ .st = st, .parsed = parsed, .output = &output, .raw = raw, .json = json, .cli_args = cli_args.items, .apply_args = !expr_mode, .attr_path = attr_path } });
         t.join();
     } else if (mode == .eval) {
         const parsed = st.parseFile(target_str) catch |e| exitEvalError(e, st);
         st.cur_file = target_str;
-        const t = try std.Thread.spawn(.{ .stack_size = 1 << 30 }, run_eval, .{ RunCtx{ .st = st, .parsed = parsed, .output = &output, .raw = raw } });
+        const t = try std.Thread.spawn(.{ .stack_size = 1 << 30 }, run_eval, .{ RunCtx{ .st = st, .parsed = parsed, .output = &output, .raw = raw, .json = json, .cli_args = cli_args.items, .apply_args = !expr_mode, .attr_path = attr_path } });
         t.join();
     }
 
@@ -200,6 +259,32 @@ fn resolveDrvPath(st: *eval.EvalState, target: []const u8) ![]const u8 {
         std.process.exit(1);
     }
     return dv.string.s;
+}
+
+const ArgPair = struct {
+    name: []const u8,
+    value: []const u8,
+    is_str: bool,
+};
+
+fn makeCliArgset(st: *eval.EvalState, args: []const ArgPair) !*value.Value {
+    const items = try st.alloc.alloc(value.Item, args.len);
+    for (args, 0..) |p, i| {
+        const v = try st.alloc.create(value.Value);
+        if (p.is_str) {
+            v.* = st.mkString(p.value, &.{});
+        } else {
+            // --arg: the value is parsed as a Nix expression.
+            const parsed = try st.parse(p.value, "<command-line-arg>");
+            v.* = try st.eval(parsed, st.base_env, 0);
+        }
+        items[i] = .{ .name = p.name, .value = v };
+    }
+    const attrs = try st.alloc.create(value.Attrs);
+    attrs.* = .{ .items = items };
+    const av = try st.alloc.create(value.Value);
+    av.* = .{ .attrs = attrs };
+    return av;
 }
 
 fn printTrace(st: *eval.EvalState) void {

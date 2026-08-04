@@ -2329,6 +2329,10 @@ fn escapeJsonString(s: []const u8) []const u8 {
     return out.toOwnedSlice() catch "";
 }
 
+pub fn jsonWritePub(st: *Eval, v: *Value, w: *std.array_list.Managed(u8)) EvalError!void {
+    return jsonWrite(st, v, w);
+}
+
 fn jsonWrite(st: *Eval, v: *Value, w: *std.array_list.Managed(u8)) EvalError!void {
     st.json_depth += 1;
     defer st.json_depth -= 1;

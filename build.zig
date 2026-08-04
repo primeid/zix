@@ -47,6 +47,11 @@ pub fn build(b: *std.Build) void {
     verify_step.dependOn(&verify_cmd.step);
     verify_cmd.step.dependOn(b.getInstallStep());
 
+    const build_step = b.step("build-smoke", "Build a derivation end-to-end in a temp store");
+    const build_cmd = b.addSystemCommand(&.{ "bash", "tests/build-smoke.sh" });
+    build_step.dependOn(&build_cmd.step);
+    build_cmd.step.dependOn(b.getInstallStep());
+
     const lang_step = b.step("lang", "Run the golden language tests (tests/lang)");
     const lang_cmd = b.addSystemCommand(&.{ "bash", "tests/run-lang.sh" });
     lang_step.dependOn(&lang_cmd.step);

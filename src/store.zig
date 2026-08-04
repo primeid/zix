@@ -30,13 +30,66 @@ pub fn checkName(name: []const u8) error{InvalidName}!void {
     }
 }
 
+pub const PathInfo = struct {
+    typ: []const u8, // "text" | "source" | "output:out" | ...
+    nar_hash: []const u8, // base16
+    refs: []const []const u8,
+    deriver: ?[]const u8 = null,
+    outputs: ?[]const []const u8 = null,
+};
+
 pub const Store = struct {
     alloc: std.mem.Allocator,
     store_dir: []const u8,
     read_only: bool,
+    /// realisation index (store path -> info)
+    db: std.StringHashMap(PathInfo),
 
     pub fn init(alloc: std.mem.Allocator, store_dir: []const u8, read_only: bool) Store {
-        return .{ .alloc = alloc, .store_dir = store_dir, .read_only = read_only };
+        return .{ .alloc = alloc, .store_dir = store_dir, .read_only = read_only, .db = std.StringHashMap(PathInfo).init(alloc) };
+    }
+
+    /// Load the realisation index (zix-db.json) if present.
+    pub fn loadDb(self: *Store) !void {
+        if (self.read_only) return;
+        const db_path = try std.fs.path.join(self.alloc, &.{ self.store_dir, "zix-db.json" });
+        const contents = fsutil.readFileAlloc(self.alloc, db_path, 1 << 30) catch return;
+        var p = JsonDbParser{ .alloc = self.alloc, .s = contents };
+        _ = p.parseInto(&self.db) catch return;
+    }
+
+    pub fn isRealised(self: *const Store, path: []const u8) bool {
+        return self.db.contains(path);
+    }
+
+    /// Register a realised store object and persist the index.
+    pub fn register(self: *Store, path: []const u8, info: PathInfo) !void {
+        try self.db.put(path, info);
+        if (!self.read_only) try self.saveDb();
+    }
+
+    fn saveDb(self: *Store) !void {
+        try fsutil.makePath(self.store_dir);
+        var w = std.array_list.Managed(u8).init(self.alloc);
+        try w.appendSlice("{\n");
+        var first = true;
+        var it = self.db.iterator();
+        while (it.next()) |e| {
+            if (!first) try w.appendSlice(",\n");
+            first = false;
+            try w.appendSlice(try std.fmt.allocPrint(self.alloc, "  \"{s}\": {{\"type\":\"{s}\",\"narHash\":\"{s}\",\"refs\":[", .{ e.key_ptr.*, e.value_ptr.typ, e.value_ptr.nar_hash }));
+            for (e.value_ptr.refs, 0..) |r, i| {
+                if (i > 0) try w.appendSlice(",");
+                try w.appendSlice(try std.fmt.allocPrint(self.alloc, "\"{s}\"", .{r}));
+            }
+            try w.appendSlice("]}");
+        }
+        try w.appendSlice("\n}\n");
+        const tmp = try std.fmt.allocPrint(self.alloc, "{s}/zix-db.json.tmp", .{self.store_dir});
+        try fsutil.writeFile(tmp, w.items);
+        const final = try std.fmt.allocPrint(self.alloc, "{s}/zix-db.json", .{self.store_dir});
+        try fsutil.writeFile(final, w.items);
+        _ = &tmp;
     }
 
     fn cat(self: *const Store, parts: []const []const u8) ![]u8 {
@@ -243,6 +296,126 @@ pub fn addPathToStore(self: *const Store, name: []const u8, path: []const u8) ![
     };
     return self.makeFixedOutputPath(name, .recursive, hash, &.{});
 }
+
+/// Copy `path` into the store: compute the path, dump the NAR (or copy the
+/// file), register it. Returns the store path.
+pub fn addToStoreWrite(self: *Store, name: []const u8, path: []const u8, method: FileIngestionMethod) ![]const u8 {
+    const sp = if (method == .recursive)
+        try self.addPathToStore(name, path)
+    else
+        blk: {
+            const st = try fsutil.statPath(path);
+            if (st.kind != .file) return error.NotAValidPath;
+            const h = try hashFlatFile(self.alloc, path);
+            break :blk try self.makeFixedOutputPath(name, .flat, h, &.{});
+        };
+    try self.writeObject(sp, path, method);
+    const h = if (method == .recursive) try hashRecursive(self.alloc, path) else try hashFlatFile(self.alloc, path);
+    var hexbuf: [2 * 32]u8 = undefined;
+    const hex = nixhash.base16Encode(&hexbuf, h.bytes[0..h.hash_size]);
+    try self.register(sp, .{
+        .typ = if (method == .recursive) "source" else "output:out",
+        .nar_hash = try self.alloc.dupe(u8, hex),
+        .refs = &.{},
+    });
+    return sp;
+}
+
+/// Write a store object: recursive → NAR file; flat → plain file copy.
+fn writeObject(self: *Store, store_path: []const u8, src: []const u8, method: FileIngestionMethod) !void {
+    try fsutil.makePath(self.store_dir);
+    const st = try fsutil.statPath(src);
+    if (method == .recursive) {
+        if (st.kind == .file or st.kind == .symlink) {
+            const contents = if (st.kind == .file) try fsutil.readFileAlloc(self.alloc, src, 1 << 30) else try fsutil.readLinkAlloc(self.alloc, src);
+            try fsutil.writeFile(store_path, contents);
+        } else {
+            // directory: write the NAR as the object content (like Nix)
+            const nar = try narDump(self.alloc, src);
+            try fsutil.writeFile(store_path, nar);
+        }
+    } else {
+        const contents = try fsutil.readFileAlloc(self.alloc, src, 1 << 30);
+        try fsutil.writeFile(store_path, contents);
+    }
+}
+
+/// Minimal JSON object parser for zix-db.json.
+const JsonDbParser = struct {
+    alloc: std.mem.Allocator,
+    s: []const u8,
+    i: usize = 0,
+
+    fn skipWs(self: *JsonDbParser) void {
+        while (self.i < self.s.len and (self.s[self.i] == ' ' or self.s[self.i] == '\n' or self.s[self.i] == '\t' or self.s[self.i] == '\r')) self.i += 1;
+    }
+
+    fn parseString(self: *JsonDbParser) ![]const u8 {
+        if (self.i >= self.s.len or self.s[self.i] != '"') return error.BadDb;
+        self.i += 1;
+        const start = self.i;
+        while (self.i < self.s.len and self.s[self.i] != '"') self.i += 1;
+        if (self.i >= self.s.len) return error.BadDb;
+        const out = self.s[start..self.i];
+        self.i += 1;
+        return out;
+    }
+
+    fn parseInto(self: *JsonDbParser, db: *std.StringHashMap(PathInfo)) !void {
+        self.skipWs();
+        if (self.i >= self.s.len or self.s[self.i] != '{') return error.BadDb;
+        self.i += 1;
+        while (true) {
+            self.skipWs();
+            if (self.i < self.s.len and self.s[self.i] == '}') break;
+            const key = try self.parseString();
+            self.skipWs();
+            if (self.i >= self.s.len or self.s[self.i] != ':') return error.BadDb;
+            self.i += 1;
+            self.skipWs();
+            if (self.i < self.s.len and self.s[self.i] == '{') {
+                self.i += 1;
+                var typ: []const u8 = "";
+                var nar: []const u8 = "";
+                var refs = std.array_list.Managed([]const u8).init(self.alloc);
+                while (true) {
+                    self.skipWs();
+                    if (self.i < self.s.len and self.s[self.i] == '}') {
+                        self.i += 1;
+                        break;
+                    }
+                    const field = try self.parseString();
+                    self.skipWs();
+                    if (self.i >= self.s.len or self.s[self.i] != ':') return error.BadDb;
+                    self.i += 1;
+                    self.skipWs();
+                    if (std.mem.eql(u8, field, "refs") and self.i < self.s.len and self.s[self.i] == '[') {
+                        self.i += 1;
+                        while (true) {
+                            self.skipWs();
+                            if (self.i < self.s.len and self.s[self.i] == ']') {
+                                self.i += 1;
+                                break;
+                            }
+                            try refs.append(try self.parseString());
+                            self.skipWs();
+                            if (self.i < self.s.len and self.s[self.i] == ',') self.i += 1;
+                        }
+                    } else {
+                        const v = try self.parseString();
+                        if (std.mem.eql(u8, field, "type")) typ = v;
+                        if (std.mem.eql(u8, field, "narHash")) nar = v;
+                    }
+                }
+                try db.put(key, .{ .typ = typ, .nar_hash = nar, .refs = refs.items });
+            } else {
+                _ = try self.parseString();
+            }
+            self.skipWs();
+            if (self.i < self.s.len and self.s[self.i] == ',') self.i += 1;
+        }
+    }
+};
 
 test "store path for toFile matches Nix" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);

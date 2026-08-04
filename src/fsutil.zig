@@ -3,8 +3,9 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-/// The default (single-threaded, debug) Io instance.
-pub const io: std.Io = std.Options.debug_io;
+/// The Io instance used for all filesystem and process operations.
+/// Defaults to the debug Io; `main` sets it to the application's real Io.
+pub var io: std.Io = std.Options.debug_io;
 
 pub const Kind = enum { file, directory, symlink, other };
 

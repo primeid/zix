@@ -14,6 +14,7 @@ const value = zix.value;
 
 pub fn main(init: std.process.Init) !void {
     const a = init.arena.allocator();
+    zix.fsutil.io = init.io;
 
     var args_iter = switch (builtin.os.tag) {
         .windows => try std.process.Args.Iterator.initAllocator(init.minimal.args, a),
@@ -26,7 +27,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     var target: ?[]const u8 = null;
-    var mode: enum { eval, parse } = .eval;
+    var mode: enum { eval, parse, build } = .eval;
     var expr_mode = false;
     var raw = false;
     var read_only = false;
@@ -49,6 +50,8 @@ pub fn main(init: std.process.Init) !void {
                 std.process.exit(1);
             }
             store_dir = argv.items[i];
+        } else if (std.mem.eql(u8, arg, "--dry-run") or std.mem.eql(u8, arg, "-v") or std.mem.eql(u8, arg, "--verbose")) {
+            // accepted; handled in the build section
         } else if (std.mem.eql(u8, arg, "-I")) {
             i += 1;
             if (i >= argv.items.len) {
@@ -58,6 +61,8 @@ pub fn main(init: std.process.Init) !void {
             try nix_path_extra.append(argv.items[i]);
         } else if (std.mem.eql(u8, arg, "parse")) {
             mode = .parse;
+        } else if (std.mem.eql(u8, arg, "build")) {
+            mode = .build;
         } else if (std.mem.eql(u8, arg, "eval")) {
             mode = .eval;
         } else if (target == null and expr_mode) {
@@ -115,7 +120,7 @@ pub fn main(init: std.process.Init) !void {
             };
         }
     }.f;
-    if (expr_mode) {
+    if (mode == .eval and expr_mode) {
         const cwd = fsutilRealpathCwd(a);
         const vfile = try std.fmt.allocPrint(a, "{s}/<command-line>", .{cwd});
         const parsed = st.parse(target_str, vfile) catch |e| {
@@ -128,15 +133,68 @@ pub fn main(init: std.process.Init) !void {
         };
         const t = try std.Thread.spawn(.{ .stack_size = 1 << 30 }, run_eval, .{ RunCtx{ .st = st, .parsed = parsed, .output = &output, .raw = raw } });
         t.join();
-    } else {
+    } else if (mode == .eval) {
         const parsed = st.parseFile(target_str) catch |e| exitEvalError(e, st);
         st.cur_file = target_str;
         const t = try std.Thread.spawn(.{ .stack_size = 1 << 30 }, run_eval, .{ RunCtx{ .st = st, .parsed = parsed, .output = &output, .raw = raw } });
         t.join();
     }
 
+    if (mode == .build) {
+        var dry_run = false;
+        var verbose = false;
+        for (argv.items[1..]) |arg| {
+            if (std.mem.eql(u8, arg, "--dry-run")) dry_run = true;
+            if (std.mem.eql(u8, arg, "-v") or std.mem.eql(u8, arg, "--verbose")) verbose = true;
+        }
+        const drv_path = try resolveDrvPath(st, target_str);
+        const build_dir = std.fs.path.dirname(store_dir) orelse "/tmp";
+        if (dry_run) {
+            const plan = zix.build.planBuild(a, &st.store, drv_path) catch |e| exitEvalError(e, st);
+            for (plan) |pstep| {
+                std.debug.print("{s}\n", .{pstep.drv_path});
+                for (pstep.drv.outputs) |o| std.debug.print("  -> {s}\n", .{o.path});
+            }
+        } else {
+            const outs = zix.build.buildAll(a, &st.store, drv_path, build_dir, verbose, init.environ_map) catch |e| exitEvalError(e, st);
+            for (outs) |o| std.debug.print("{s}\n", .{o});
+        }
+        return;
+    }
+
     try output.append('\n');
     writeStdout(output.items);
+}
+
+/// Resolve a `zix build` target to a .drv store path: either a path ending
+/// in `.drv`, or a Nix expression/file whose value is a derivation.
+fn resolveDrvPath(st: *eval.EvalState, target: []const u8) ![]const u8 {
+    if (std.mem.endsWith(u8, target, ".drv") and zix.fsutil.pathExists(target)) return target;
+    var result: value.Value = undefined;
+    if (zix.fsutil.pathExists(target)) {
+        result = st.importPath(target) catch |e| exitEvalError(e, st);
+    } else {
+        const cwd = fsutilRealpathCwd(st.alloc);
+        const vfile = try std.fmt.allocPrint(st.alloc, "{s}/<command-line>", .{cwd});
+        const parsed = st.parse(target, vfile) catch |e| exitEvalError(e, st);
+        result = st.eval(parsed, st.base_env, 0) catch |e| exitEvalError(e, st);
+    }
+    try st.force(&result);
+    if (result != .attrs) {
+        std.debug.print("zix: error: 'zix build' target is not a derivation\n", .{});
+        std.process.exit(1);
+    }
+    const dp = result.attrs.find("drvPath") orelse {
+        std.debug.print("zix: error: 'zix build' target is not a derivation\n", .{});
+        std.process.exit(1);
+    };
+    var dv = dp.*;
+    try st.force(&dv);
+    if (dv != .string) {
+        std.debug.print("zix: error: 'zix build' target is not a derivation\n", .{});
+        std.process.exit(1);
+    }
+    return dv.string.s;
 }
 
 fn exitEvalError(e: anyerror, st: *eval.EvalState) noreturn {

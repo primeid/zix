@@ -43,6 +43,18 @@ Options: `--raw` (raw strings), `--read-only` (don't write to the store),
 `--store-dir DIR` (own store, e.g. `/tmp/zs`), `-I path` / `NIX_PATH`
 for `<nixpkgs>` lookup, `zix parse FILE` (lex+parse only).
 
+### Building derivations
+
+```console
+$ zix build --store-dir /tmp/zs example.nix     # build a derivation expression
+$ zix build --store-dir /tmp/zs --dry-run x.drv  # show the build plan
+```
+
+`zix build` realises a derivation (and its inputs) in a writable store
+(`--store-dir`); fixed-output derivations are verified by hash, outputs are
+registered in the store database (`zix-db.json`). The default `/nix/store` is
+usually not writable by the current user — use `--store-dir DIR`.
+
 Examples live in [`examples/`](examples/).
 
 ## Architecture

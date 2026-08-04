@@ -11,6 +11,7 @@ pub const parser = @import("parser.zig");
 pub const value = @import("value.zig");
 pub const eval = @import("eval.zig");
 pub const builtins = @import("builtins.zig");
+pub const build = @import("build.zig");
 pub const tests = @import("tests.zig");
 
 test {
@@ -23,5 +24,6 @@ test {
     _ = value;
     _ = eval;
     _ = builtins;
+    _ = build;
     _ = tests;
 }

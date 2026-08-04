@@ -2415,7 +2415,7 @@ fn jsonWrite(st: *Eval, v: *Value, w: *std.array_list.Managed(u8)) EvalError!voi
             try w.append('}');
         },
         .lambda => {
-            try w.appendSlice("\"<LAMBDA>\"");
+            return st.userError("cannot convert a function to JSON", .{});
         },
         else => return st.userError("cannot convert {s} to JSON", .{eval.EvalState.showType(v.*)}),
     }

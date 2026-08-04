@@ -758,6 +758,11 @@ pub const Parser = struct {
                 _ = self.advance();
                 default = try self.parseExpr();
             }
+            for (formals.items) |f| {
+                if (std.mem.eql(u8, f.name, t.text)) {
+                    return error.DuplicateFormal;
+                }
+            }
             try formals.append(.{ .name = t.text, .default = default });
             if (self.peek().kind == .comma) {
                 _ = self.advance();

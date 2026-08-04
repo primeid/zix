@@ -64,6 +64,14 @@ fn printTest(st: *eval.EvalState, v: *value.Value, w: *std.array_list.Managed(u8
     }
 }
 
+fn expectParseErr(alloc: std.mem.Allocator, src: []const u8) !void {
+    const st = try newState(alloc);
+    defer st.deinit();
+    _ = st.parse(src, "<test>") catch return;
+    std.debug.print("expected parse error but succeeded: {s}\n", .{src});
+    return error.TestExpectedEqual;
+}
+
 fn expectEval(alloc: std.mem.Allocator, src: []const u8, expected: []const u8) !void {
     const out = try evalAndPrint(alloc, src);
     if (!std.mem.eql(u8, out, expected)) {
@@ -386,4 +394,8 @@ test "eval: deep-test regressions (float, split, recursion, toXML, hashes)" {
     try expectEval(a, "builtins.dirOf /a/b/c.txt", "/a/b");
     // primop printing includes the closing guillemet
     try expectEvalNix(a, "builtins.attrValues", "«primop attrValues»");
+    // duplicate formals are a parse error (like Nix)
+    try expectParseErr(a, "{ x, x }: 1");
+    // toJSON of a function errors (like Nix)
+    try expectEvalErr(a, "builtins.toJSON (x: x)", "UserError");
 }

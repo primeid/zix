@@ -13,10 +13,16 @@ jobs:
         include:
           - os: ubuntu-latest
             triple: x86_64-linux
+            ext: tar.xz
+            zdir: zig-x86_64-linux-0.16.0
           - os: macos-latest
             triple: aarch64-macos
+            ext: tar.xz
+            zdir: zig-aarch64-macos-0.16.0
           - os: windows-latest
             triple: x86_64-windows
+            ext: zip
+            zdir: zig-x86_64-windows-0.16.0
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -25,11 +31,12 @@ jobs:
         shell: bash
         run: |
           set -eux
-          curl -L -o zig.tar \
-            "https://ziglang.org/download/0.16.0/zig-${{ matrix.triple }}-0.16.0.tar.xz"
-          tar -xJf zig.tar
-          echo "$PWD/zig-${{ matrix.triple }}-0.16.0" >> "$GITHUB_PATH"
-          zig version
+          curl -L -o "zig.${{ matrix.ext }}" \
+            "https://ziglang.org/download/0.16.0/zig-${{ matrix.triple }}-0.16.0.${{ matrix.ext }}"
+          # Windows: bsdtar reads .zip; Linux/macOS: xz
+          if [ "${{ matrix.ext }}" = "zip" ]; then tar -xf "zig.zip"; else tar -xJf "zig.tar.xz"; fi
+          echo "$PWD/${{ matrix.zdir }}" >> "$GITHUB_PATH"
+          "$PWD/${{ matrix.zdir }}/zig" version
 
       - name: Build
         run: zig build

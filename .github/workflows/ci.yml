@@ -27,16 +27,25 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Zig 0.16.0 (ziglang.org)
+      - name: Install Zig 0.16.0 (ziglang.org, posix)
+        if: runner.os != 'Windows'
         shell: bash
         run: |
           set -eux
-          curl -L -o "zig.${{ matrix.ext }}" \
-            "https://ziglang.org/download/0.16.0/zig-${{ matrix.triple }}-0.16.0.${{ matrix.ext }}"
-          # Windows: bsdtar reads .zip; Linux/macOS: xz
-          if [ "${{ matrix.ext }}" = "zip" ]; then tar -xf "zig.zip"; else tar -xJf "zig.tar.xz"; fi
+          curl -L -o "zig.tar.xz" \
+            "https://ziglang.org/download/0.16.0/zig-${{ matrix.triple }}-0.16.0.tar.xz"
+          tar -xJf "zig.tar.xz"
           echo "$PWD/${{ matrix.zdir }}" >> "$GITHUB_PATH"
           "$PWD/${{ matrix.zdir }}/zig" version
+
+      - name: Install Zig 0.16.0 (ziglang.org, windows)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          curl.exe -L -o zig.zip "https://ziglang.org/download/0.16.0/zig-x86_64-windows-0.16.0.zip"
+          Expand-Archive -Path zig.zip -DestinationPath .
+          Add-Content -Path $env:GITHUB_PATH -Value "$env:GITHUB_WORKSPACE/zig-x86_64-windows-0.16.0"
+          .\zig-x86_64-windows-0.16.0\zig.exe version
 
       - name: Build
         run: zig build

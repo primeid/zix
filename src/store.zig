@@ -215,11 +215,31 @@ pub const NarWriter = struct {
 };
 
 /// Serialize `path` into NAR format (Nix `dumpPath`).
+pub const FilterFn = *const fn (ctx: *anyopaque, path: []const u8, kind: []const u8) bool;
+
 pub fn narDump(alloc: std.mem.Allocator, path: []const u8) ![]const u8 {
     var w = NarWriter.init(alloc);
     try w.writeString("nix-archive-1");
     try narNode(&w, path);
     return w.buf.items;
+}
+
+/// NAR dump with a per-entry filter (for `builtins.path { filter = ...; }`).
+/// Excluded entries are omitted entirely, like Nix's filterSource.
+pub fn narDumpFiltered(alloc: std.mem.Allocator, path: []const u8, filter_ctx: *anyopaque, filter: FilterFn) ![]const u8 {
+    var w = NarWriter.init(alloc);
+    try w.writeString("nix-archive-1");
+    _ = try narNodeFiltered(&w, path, filter_ctx, filter);
+    return w.buf.items;
+}
+
+fn kindString(kind: fsutil.Kind) []const u8 {
+    return switch (kind) {
+        .file => "regular",
+        .directory => "directory",
+        .symlink => "symlink",
+        else => "unknown",
+    };
 }
 
 fn narNode(w: *NarWriter, path: []const u8) !void {
@@ -268,6 +288,60 @@ fn narNode(w: *NarWriter, path: []const u8) !void {
     }
 }
 
+fn narNodeFiltered(w: *NarWriter, path: []const u8, ctx: *anyopaque, filter: FilterFn) !bool {
+    const st = try fsutil.statPath(path);
+    if (!filter(ctx, path, kindString(st.kind))) {
+        return false; // excluded — caller skips the entry
+    }
+    switch (st.kind) {
+        .symlink => {
+            const target = try fsutil.readLinkAlloc(w.alloc, path);
+            try w.writeString("(");
+            try w.writeString("type");
+            try w.writeString("symlink");
+            try w.writeString("target");
+            try w.writeString(target);
+            try w.writeString(")");
+            return true;
+        },
+        .file => {
+            try w.writeString("(");
+            try w.writeString("type");
+            try w.writeString("regular");
+            if (st.executable) {
+                try w.writeString("executable");
+                try w.writeString("");
+            }
+            try w.writeString("contents");
+            const contents = try fsutil.readFileAlloc(w.alloc, path, 1 << 30);
+            try w.writeString(contents);
+            try w.writeString(")");
+            return true;
+        },
+        .directory => {
+            try w.writeString("(");
+            try w.writeString("type");
+            try w.writeString("directory");
+            const names = try fsutil.readDirNames(w.alloc, path);
+            for (names) |name| {
+                const child = try std.fs.path.join(w.alloc, &.{ path, name });
+                const cst = try fsutil.statPath(child);
+                if (!filter(ctx, child, kindString(cst.kind))) continue;
+                try w.writeString("entry");
+                try w.writeString("(");
+                try w.writeString("name");
+                try w.writeString(name);
+                try w.writeString("node");
+                _ = try narNodeFiltered(w, child, ctx, filter);
+                try w.writeString(")");
+            }
+            try w.writeString(")");
+            return true;
+        },
+        .other => return error.NotAValidPath,
+    }
+}
+
 /// Nix `hashPath` flat: sha256 of file contents.
 pub fn hashFlatFile(alloc: std.mem.Allocator, path: []const u8) !Hash {
     const contents = try fsutil.readFileAlloc(alloc, path, 1 << 30);
@@ -300,8 +374,9 @@ pub fn addPathToStore(self: *const Store, name: []const u8, path: []const u8) ![
 /// Copy `path` into the store: compute the path, dump the NAR (or copy the
 /// file), register it. Returns the store path.
 pub fn addToStoreWrite(self: *Store, name: []const u8, path: []const u8, method: FileIngestionMethod) ![]const u8 {
+    try fsutil.makePath(self.store_dir);
     const sp = if (method == .recursive)
-        try self.addPathToStore(name, path)
+        try addPathToStore(self, name, path)
     else
         blk: {
             const st = try fsutil.statPath(path);
@@ -309,7 +384,7 @@ pub fn addToStoreWrite(self: *Store, name: []const u8, path: []const u8, method:
             const h = try hashFlatFile(self.alloc, path);
             break :blk try self.makeFixedOutputPath(name, .flat, h, &.{});
         };
-    try self.writeObject(sp, path, method);
+    try writeObject(self, sp, path, method);
     const h = if (method == .recursive) try hashRecursive(self.alloc, path) else try hashFlatFile(self.alloc, path);
     var hexbuf: [2 * 32]u8 = undefined;
     const hex = nixhash.base16Encode(&hexbuf, h.bytes[0..h.hash_size]);

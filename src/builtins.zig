@@ -1316,21 +1316,97 @@ fn primToFile(st: *Eval, args: []const *Value, pos: usize) EvalError!Value {
     return st.mkString(p, ctx2.items);
 }
 
+const PathFilterCtx = struct {
+    st: *Eval,
+    filter: Value,
+
+    fn apply(ctx: *anyopaque, path: []const u8, kind: []const u8) bool {
+        const self: *PathFilterCtx = @ptrCast(@alignCast(ctx));
+        const pv = self.st.alloc.create(Value) catch return true;
+        pv.* = self.st.mkString(path, &.{});
+        const kv = self.st.alloc.create(Value) catch return true;
+        kv.* = self.st.mkString(kind, &.{});
+        // The filter is curried: `path: type: bool`
+        var r = self.st.apply(self.filter, pv, 0) catch return true;
+        r = self.st.apply(r, kv, 0) catch return true;
+        var rv = r;
+        self.st.force(&rv) catch return true;
+        return rv == .bool_ and rv.bool_;
+    }
+};
+
 fn primPath(st: *Eval, args: []const *Value, pos: usize) EvalError!Value {
     _ = pos;
-
     const a = try forceAttrs(st, args[0], "while evaluating the argument to builtins.path");
     const path_v = a.find("path") orelse return st.userError("attribute 'path' missing", .{});
     var pv = path_v.*;
     try st.force(&pv);
     const p: []const u8 = switch (pv) {
-        .path => |p| p.p,
+        .path => |pp| pp.p,
         .string => |s| s.s,
         else => return st.userError("'path' attribute is not a path", .{}),
     };
-    const sp = st.copyPathToStore(p) catch |e| {
-        return st.userError("cannot copy '{s}' to the store: {s}", .{ p, @errorName(e) });
+    var name: []const u8 = std.fs.path.basename(p);
+    if (a.find("name")) |nv| {
+        var n2 = nv.*;
+        name = try forceStringNoCtx(st, &n2, "while evaluating the 'name' attribute");
+    }
+    var recursive = true;
+    if (a.find("recursive")) |rv| {
+        var r2 = rv.*;
+        recursive = try forceBool(st, &r2, "while evaluating the 'recursive' attribute");
+    }
+    // Filtered paths: build the filtered NAR, hash it, write it directly.
+    if (a.find("filter")) |fv| {
+        var f2 = fv.*;
+        try st.force(&f2);
+        var fctx = PathFilterCtx{ .st = st, .filter = f2 };
+        const nar = store.narDumpFiltered(st.alloc, p, &fctx, PathFilterCtx.apply) catch |e| {
+            return st.userError("cannot copy '{s}' to the store: {s}", .{ p, @errorName(e) });
+        };
+        const hash = store.Hash.of(nar);
+        const sp = st.store.makeFixedOutputPath(name, .recursive, hash, &.{}) catch |e| {
+            return st.userError("cannot compute store path: {s}", .{@errorName(e)});
+        };
+        if (!st.store.read_only) {
+            fsutil.makePath(st.store.store_dir) catch |e| {
+                return st.userError("cannot write to store: {s}", .{@errorName(e)});
+            };
+            fsutil.writeFile(sp, nar) catch |e| {
+                return st.userError("cannot write to store: {s}", .{@errorName(e)});
+            };
+        }
+        var ctx = std.array_list.Managed(value.CtxElem).init(st.alloc);
+        try ctx.append(.{ .kind = .opaq, .path = sp });
+        return st.mkString(sp, ctx.items);
+    }
+    var hash: store.Hash = undefined;
+    if (recursive) {
+        hash = store.hashRecursive(st.alloc, p) catch |e| {
+            return st.userError("cannot copy '{s}' to the store: {s}", .{ p, @errorName(e) });
+        };
+    } else {
+        hash = store.hashFlatFile(st.alloc, p) catch |e| {
+            return st.userError("cannot copy '{s}' to the store: {s}", .{ p, @errorName(e) });
+        };
+    }
+    if (a.find("sha256")) |hv| {
+        var h2 = hv.*;
+        try st.force(&h2);
+        const hs = try forceStringNoCtx(st, &h2, "while evaluating the 'sha256' attribute");
+        const eh = nixhash.parseHash(st.alloc, hs) catch return st.userError("invalid sha256 hash '{s}'", .{hs});
+        if (!eh.eql(hash)) {
+            return st.userError("hash mismatch: expected {s} but got {s}", .{ try eh.base16(st.alloc), try hash.base16(st.alloc) });
+        }
+    }
+    const sp = st.store.makeFixedOutputPath(name, if (recursive) .recursive else .flat, hash, &.{}) catch |e| {
+        return st.userError("cannot compute store path: {s}", .{@errorName(e)});
     };
+    if (!st.store.read_only) {
+        _ = store.addToStoreWrite(&st.store, name, p, if (recursive) .recursive else .flat) catch |e| {
+            return st.userError("cannot write to store: {s}", .{@errorName(e)});
+        };
+    }
     var ctx = std.array_list.Managed(value.CtxElem).init(st.alloc);
     try ctx.append(.{ .kind = .opaq, .path = sp });
     return st.mkString(sp, ctx.items);
@@ -1528,10 +1604,27 @@ fn primImport(st: *Eval, args: []const *Value, pos: usize) EvalError!Value {
 
 fn primScopedImport(st: *Eval, args: []const *Value, pos: usize) EvalError!Value {
     _ = pos;
-
-    _ = st;
-    _ = args;
-    return error.Unsupported;
+    const scope = try forceAttrs(st, args[0], "while evaluating the first argument to builtins.scopedImport");
+    var v = args[1].*;
+    try st.force(&v);
+    const p: []const u8 = switch (v) {
+        .path => |p| p.p,
+        .string => |s| s.s,
+        else => return st.userError("'scopedImport' called on {s}, expected a path", .{eval.EvalState.showType(v)}),
+    };
+    const vars = try st.alloc.alloc(value.Var, scope.items.len);
+    for (scope.items, 0..) |it, i| vars[i] = .{ .name = it.name, .value = it.value };
+    const scope_env = try st.alloc.create(value.Env);
+    scope_env.* = .{ .parent = st.base_env, .vars = vars };
+    const resolved = if (fsutil.isDirectory(p)) std.fs.path.join(st.alloc, &.{ p, "default.nix" }) catch return error.OutOfMemory else p;
+    const contents = fsutil.readFileAlloc(st.alloc, resolved, 1 << 30) catch |e| {
+        return st.userError("cannot read '{s}': {s}", .{ resolved, @errorName(e) });
+    };
+    const parsed = try st.parse(contents, resolved);
+    const prev = st.cur_file;
+    st.cur_file = resolved;
+    defer st.cur_file = prev;
+    return st.eval(parsed, scope_env, 0);
 }
 
 fn primTryEval(st: *Eval, args: []const *Value, pos: usize) EvalError!Value {

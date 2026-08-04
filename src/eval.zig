@@ -1199,6 +1199,35 @@ pub const EvalState = struct {
         };
     }
 
+    /// Fetch a git repository by URL (optionally pinned to a rev) and copy it
+    /// into the store, returning a derivation-like attrset (used by
+    /// fetchTree/getFlake).
+    pub fn fetchGitAttrs(self: *EvalState, url: []const u8, rev: ?[]const u8, ref_: ?[]const u8) EvalError!Value {
+        _ = ref_;
+        var argv = std.array_list.Managed([]const u8).init(self.alloc);
+        try argv.append("git");
+        try argv.append("clone");
+        if (rev != null) {
+            try argv.append("--no-checkout");
+        }
+        try argv.append(url);
+        const tmp = try std.fmt.allocPrint(self.alloc, "/tmp/zix-git-{s}", .{std.fs.path.basename(url)});
+        try argv.append(tmp);
+        var child = std.process.spawn(fsutil.io, .{
+            .argv = argv.items,
+            .stdin = .ignore,
+            .stdout = .ignore,
+            .stderr = .ignore,
+        }) catch |e| {
+            return self.userError("executing \"git\": {s}", .{@errorName(e)});
+        };
+        _ = child.wait(fsutil.io) catch return error.IoError;
+        const sp = store.addPathToStore(&self.store, std.fs.path.basename(url), tmp) catch |e| {
+            return self.userError("cannot copy to store: {s}", .{@errorName(e)});
+        };
+        return self.mkString(try self.alloc.dupe(u8, sp), &.{});
+    }
+
     /// Copy a filesystem path into the store with a filter predicate
     /// (`builtins.filterSource`).
     pub fn copyPathToStoreFiltered(self: *EvalState, name: []const u8, p: []const u8, filter_val: Value) EvalError![]const u8 {

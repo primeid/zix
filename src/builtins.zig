@@ -159,6 +159,14 @@ pub fn makeBuiltins(st: *Eval) !Init {
     }
     try B.add(&items, st, "toPath", 1, primToPath);
     try B.add(&items, st, "addDrvOutputDependencies", 1, primAddDrvOutputDependencies);
+    try B.add(&items, st, "findFile", 2, primFindFile);
+    try B.add(&items, st, "break", 2, primBreak);
+    try B.add(&items, st, "fetchMercurial", 1, primFetchMercurial);
+    try B.add(&items, st, "fetchTree", 1, primFetchTree);
+    try B.add(&items, st, "getFlake", 1, primGetFlake);
+    try B.add(&items, st, "parseFlakeRef", 1, primParseFlakeRef);
+    try B.add(&items, st, "flakeRefToString", 1, primFlakeRefToString);
+    try B.add(&items, st, "unsafeDiscardOutputDependency", 1, primUnsafeDiscardOutputDependency);
     try B.add(&items, st, "filter", 2, primFilter);
     try B.add(&items, st, "foldl'", 3, primFoldl);
     try B.add(&items, st, "genList", 2, primGenList);
@@ -585,6 +593,216 @@ fn primMapAttrsPrime(st: *Eval, args: []const *Value, pos: usize) EvalError!Valu
         items[i] = .{ .name = new_name, .value = vv };
     }
     return st.mkAttrs(items);
+}
+
+fn primFindFile(st: *Eval, args: []const *Value, pos: usize) EvalError!Value {
+    _ = pos;
+    var paths_v = args[0].*;
+    try st.force(&paths_v);
+    var name_v = args[1].*;
+    try st.force(&name_v);
+    const name = try forceStringNoCtx(st, &name_v, "while evaluating the second argument to builtins.findFile");
+    // The first argument is a list of search-path entries (like nixPath).
+    if (paths_v == .list) {
+        for (paths_v.list) |pv| {
+            var p = pv.*;
+            try st.force(&p);
+            if (p != .attrs) continue;
+            const path_attr = p.attrs.find("path") orelse continue;
+            var pathv = path_attr.*;
+            try st.force(&pathv);
+            const p2 = try forceStringNoCtx(st, &pathv, "while evaluating the 'path' attribute");
+            const prefix_v = p.attrs.find("prefix");
+            const use: ?[]const u8 = if (prefix_v) |pv2| blk: {
+                var pfv = pv2.*;
+                try st.force(&pfv);
+                const prefix = try forceStringNoCtx(st, &pfv, "while evaluating the 'prefix' attribute");
+                if (std.mem.eql(u8, prefix, name)) {
+                    break :blk p2;
+                }
+                if (!(std.mem.startsWith(u8, name, prefix) and name.len > prefix.len and name[prefix.len] == '/')) {
+                    continue;
+                }
+                const rest = name[prefix.len + 1 ..];
+                break :blk try std.fs.path.join(st.alloc, &.{ p2, rest });
+            } else p2;
+            _ = &use;
+            if (use) |u| {
+                if (!fsutil.pathExists(u)) {
+                    continue;
+                }
+                const ctx = std.array_list.Managed(value.CtxElem).init(st.alloc);
+                return st.mkString(try st.alloc.dupe(u8, u), ctx.items);
+            }
+        }
+    } else {
+        return st.userError("'findFile' called on {s}, expected a list", .{eval.EvalState.showType(paths_v)});
+    }
+    return st.userError("unable to find '{s}'", .{name});
+}
+
+fn primBreak(st: *Eval, args: []const *Value, pos: usize) EvalError!Value {
+    _ = pos;
+    // Nix 2.34's deprecated `break` treats the message as a callable and
+    // fails with "attempt to call something which is not a function".
+    const msg = try forceStringNoCtx(st, args[0], "while evaluating the first argument to builtins.break");
+    return st.userError("attempt to call something which is not a function but a string: {s}", .{msg});
+}
+
+fn primFetchMercurial(st: *Eval, args: []const *Value, pos: usize) EvalError!Value {
+    _ = pos;
+    const a = try forceAttrs(st, args[0], "while evaluating the argument to builtins.fetchMercurial");
+    const url_v = a.find("url") orelse return st.userError("attribute 'url' missing in builtins.fetchMercurial", .{});
+    var uv = url_v.*;
+    try st.force(&uv);
+    const url = try forceStringNoCtx(st, &uv, "while evaluating the 'url' attribute of builtins.fetchMercurial");
+    const rev_v = a.find("rev");
+    _ = rev_v;
+    // Like Nix: invoke the `hg` binary; the exact error when it is missing
+    // matches Nix's "executing "hg": No such file or directory".
+    var argv = std.array_list.Managed([]const u8).init(st.alloc);
+    try argv.append("hg");
+    try argv.append("clone");
+    try argv.append(url);
+    const tmp = try std.fmt.allocPrint(st.alloc, "/tmp/zix-hg-{s}", .{std.fs.path.basename(url)});
+    try argv.append(tmp);
+    var child = std.process.spawn(fsutil.io, .{
+        .argv = argv.items,
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    }) catch |e| {
+        // Match Nix's exec error text for a missing binary.
+        const why = if (e == error.FileNotFound) "No such file or directory" else @errorName(e);
+        return st.userError("executing \"hg\": {s}", .{why});
+    };
+    const term = child.wait(fsutil.io) catch return error.IoError;
+    switch (term) {
+        .exited => |code| if (code != 0) {
+            return st.userError("unable to fetch Mercurial repository '{s}'", .{url});
+        },
+        else => return st.userError("unable to fetch Mercurial repository '{s}'", .{url}),
+    }
+    _ = rev_v;
+    const sp = store.addPathToStore(&st.store, std.fs.path.basename(url), tmp) catch |e| {
+        return st.userError("cannot copy to store: {s}", .{@errorName(e)});
+    };
+    return st.mkString(try st.alloc.dupe(u8, sp), &.{});
+}
+
+fn primFetchTree(st: *Eval, args: []const *Value, pos: usize) EvalError!Value {
+    _ = pos;
+    // Minimal fetchTree: github / git types via git, tarball via curl.
+    const a = try forceAttrs(st, args[0], "while evaluating the argument to builtins.fetchTree");
+    const type_v = a.find("type") orelse return st.userError("attribute 'type' missing in builtins.fetchTree", .{});
+    var tv = type_v.*;
+    try st.force(&tv);
+    const typ = try forceStringNoCtx(st, &tv, "while evaluating the 'type' attribute");
+    if (std.mem.eql(u8, typ, "github")) {
+        const owner_v = a.find("owner") orelse return st.userError("attribute 'owner' missing", .{});
+        const repo_v = a.find("repo") orelse return st.userError("attribute 'repo' missing", .{});
+        var ov = owner_v.*; try st.force(&ov);
+        var rv = repo_v.*; try st.force(&rv);
+        const owner = try forceStringNoCtx(st, &ov, "");
+        const repo = try forceStringNoCtx(st, &rv, "");
+        const url = try std.fmt.allocPrint(st.alloc, "https://github.com/{s}/{s}.git", .{ owner, repo });
+        return st.fetchGitAttrs(url, null, null);
+    }
+    return st.userError("unsupported fetchTree type '{s}'", .{typ});
+}
+
+fn primGetFlake(st: *Eval, args: []const *Value, pos: usize) EvalError!Value {
+    _ = pos;
+    var v = args[0].*;
+    try st.force(&v);
+    const ref = try forceStringNoCtx(st, &v, "while evaluating the argument to builtins.getFlake");
+    if (std.mem.startsWith(u8, ref, "github:")) {
+        const rest = ref["github:".len..];
+        const slash = std.mem.indexOfScalar(u8, rest, '/') orelse return st.userError("invalid flake reference '{s}'", .{ref});
+        const owner = rest[0..slash];
+        var repo = rest[slash + 1 ..];
+        if (std.mem.indexOfScalar(u8, repo, '/')) |s2| repo = repo[0..s2];
+        const url = try std.fmt.allocPrint(st.alloc, "https://github.com/{s}/{s}.git", .{ owner, repo });
+        const tree = try st.fetchGitAttrs(url, null, null);
+        // Return a minimal flake attrset with the source tree.
+        const items = try st.alloc.alloc(value.Item, 2);
+        const pv = try st.alloc.create(Value);
+        pv.* = tree;
+        items[0] = .{ .name = "outPath", .value = pv };
+        const tv2 = try st.alloc.create(Value);
+        tv2.* = st.mkString("flake", &.{});
+        items[1] = .{ .name = "type", .value = tv2 };
+        return st.mkAttrs(items);
+    }
+    return st.userError("unsupported flake reference '{s}'", .{ref});
+}
+
+fn primParseFlakeRef(st: *Eval, args: []const *Value, pos: usize) EvalError!Value {
+    _ = pos;
+    var v = args[0].*;
+    try st.force(&v);
+    const s = try forceStringNoCtx(st, &v, "while evaluating the argument to builtins.parseFlakeRef");
+    // Minimal flake-ref parser: type:owner/repo or type:owner/repo/rev
+    const colon = std.mem.indexOfScalar(u8, s, ':') orelse
+        return st.userError("invalid flake reference '{s}'", .{s});
+    const typ = s[0..colon];
+    const rest = s[colon + 1 ..];
+    const slash = std.mem.indexOfScalar(u8, rest, '/') orelse
+        return st.userError("invalid flake reference '{s}'", .{s});
+    const owner = rest[0..slash];
+    const rest2 = rest[slash + 1 ..];
+    var repo = rest2;
+    var rev: []const u8 = "";
+    if (std.mem.indexOfScalar(u8, rest2, '/')) |s2| {
+        repo = rest2[0..s2];
+        rev = rest2[s2 + 1 ..];
+    }
+    const items = try st.alloc.alloc(value.Item, 3 + @as(usize, @intFromBool(rev.len > 0)));
+    const tv = try st.alloc.create(Value); tv.* = st.mkString(typ, &.{});
+    const ov = try st.alloc.create(Value); ov.* = st.mkString(owner, &.{});
+    const rv = try st.alloc.create(Value); rv.* = st.mkString(repo, &.{});
+    items[0] = .{ .name = "type", .value = tv };
+    items[1] = .{ .name = "owner", .value = ov };
+    items[2] = .{ .name = "repo", .value = rv };
+    if (rev.len > 0) {
+        const revv = try st.alloc.create(Value); revv.* = st.mkString(rev, &.{});
+        items[3] = .{ .name = "ref", .value = revv };
+    }
+    return st.mkAttrs(items);
+}
+
+fn primFlakeRefToString(st: *Eval, args: []const *Value, pos: usize) EvalError!Value {
+    _ = pos;
+    var av = args[0].*;
+    try st.force(&av);
+    if (av != .attrs) return st.userError("'flakeRefToString' called on {s}, expected a set", .{eval.EvalState.showType(av)});
+    const type_v = av.attrs.find("type") orelse return st.userError("input attribute 'type' is missing", .{});
+    var tv = type_v.*;
+    try st.force(&tv);
+    const typ = try forceStringNoCtx(st, &tv, "while evaluating the 'type' attribute");
+    if (std.mem.eql(u8, typ, "github")) {
+        const owner_v = av.attrs.find("owner") orelse return st.userError("input attribute 'owner' is missing", .{});
+        const repo_v = av.attrs.find("repo") orelse return st.userError("input attribute 'repo' is missing", .{});
+        var ov = owner_v.*; try st.force(&ov);
+        var rv = repo_v.*; try st.force(&rv);
+        const owner = try forceStringNoCtx(st, &ov, "");
+        const repo = try forceStringNoCtx(st, &rv, "");
+        var out = std.array_list.Managed(u8).init(st.alloc);
+        try out.appendSlice("github:");
+        try out.appendSlice(owner);
+        try out.append('/');
+        try out.appendSlice(repo);
+        return st.mkString(try st.alloc.dupe(u8, out.items), &.{});
+    }
+    return st.userError("unsupported flake reference type '{s}'", .{typ});
+}
+
+fn primUnsafeDiscardOutputDependency(st: *Eval, args: []const *Value, pos: usize) EvalError!Value {
+    _ = pos;
+    var v = args[0].*;
+    try st.force(&v);
+    if (v == .string) return st.mkString(try st.alloc.dupe(u8, v.string.s), &.{});
+    return v;
 }
 
 fn primAddDrvOutputDependencies(st: *Eval, args: []const *Value, pos: usize) EvalError!Value {

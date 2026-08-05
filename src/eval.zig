@@ -260,17 +260,21 @@ pub const EvalState = struct {
             switch (v.*) {
                 .thunk => |t| {
                     if (t.builtin) |b| {
-                        // Lazy builtin application: run it on first force.
-                        v.* = b.f(self, b.args, t.pos) catch |e| {
+                        // Lazy builtin application: run it once and memoize the
+                        // result (constant primops like currentTime must not
+                        // re-run on every force of the same thunk).
+                        const val = b.f(self, b.args, t.pos) catch |e| {
                             return e;
                         };
+                        t.state.value = val;
+                        t.state.phase = .done;
+                        v.* = val;
                         continue;
                     }
 
 
                     switch (t.state.phase) {
                         .evaluating => {
-                            std.debug.print("DBG IR thunk expr={s} pos=«{s}»:{d}\n", .{ @tagName(t.expr.kind), t.expr.pos.file, t.expr.pos.line });
                             return error.InfiniteRecursion;
                         },
                         .done => {
@@ -280,7 +284,8 @@ pub const EvalState = struct {
                             // `let y = z; z = y; in y`).
                             var cur = t.state.value;
                             var hops: usize = 0;
-                            while (cur == .thunk and cur.thunk.state.phase == .done and hops < 16) : (hops += 1) {
+                            while (cur == .thunk and cur.thunk.state.phase == .done) : (hops += 1) {
+                                if (hops > 1_000_000) return error.InfiniteRecursion;
                                 if (cur.thunk.state == t.state) {
                                     return error.InfiniteRecursion;
                                 }
@@ -290,7 +295,13 @@ pub const EvalState = struct {
                         },
                         .unevaluated => {
                             t.state.phase = .evaluating;
-                            const val = try self.eval(t.expr, t.env, t.pos);
+                            const val = self.eval(t.expr, t.env, t.pos) catch |e| {
+                                // Restore the thunk so a retry re-evaluates it
+                                // (like Nix); a failed thunk must not stay
+                                // poisoned as an "infinite recursion".
+                                t.state.phase = .unevaluated;
+                                return e;
+                            };
                             // Evaluating to a thunk that shares our state means
                             // the expression is self-referential.
                             if (val == .thunk and val.thunk.state == t.state) {
@@ -675,10 +686,13 @@ pub const EvalState = struct {
                 // (`__functor self arg`), like Nix.
                 if (f.attrs.find("__functor")) |functor| {
                     // `set arg` == `set.__functor set arg` (the functor receives
-                    // the set itself, like Nix).
+                    // the set itself, like Nix).  The self pointer must be heap
+                    // allocated: `apply` may capture it in a partial builtin or
+                    // a closure env that outlives this stack frame.
                     const functor_v = functor.*;
-                    var self_v: Value = f;
-                    const r1 = try self.apply(functor_v, &self_v, pos);
+                    const self_ptr = try self.alloc.create(Value);
+                    self_ptr.* = f;
+                    const r1 = try self.apply(functor_v, self_ptr, pos);
                     return self.apply(r1, arg, pos);
                 }
                 return self.userError("attempt to call something which is not a function but a set", .{});
@@ -801,7 +815,15 @@ pub const EvalState = struct {
             }
             if (found) |gi| {
                 if (rest_binds.len > 0) {
-                    try groups.items[gi].rest.append(rest_binds[0]);
+                    if (groups.items[gi].value_expr != null) {
+                        // Nix merges nested binds into an attrset value
+                        // (`{ a = { x = 1; }; a.b = 2; }` works when the keys
+                        // don't collide).  Fold both into a single group:
+                        // the nested rest joins the existing value.
+                        try groups.items[gi].rest.append(rest_binds[0]);
+                    } else {
+                        try groups.items[gi].rest.append(rest_binds[0]);
+                    }
                 } else {
                     if (groups.items[gi].value_expr != null) return error.DuplicateAttr;
                     groups.items[gi].value_expr = bind.value;
@@ -844,7 +866,16 @@ pub const EvalState = struct {
         for (groups.items, 0..) |g, i| {
             const item_env = rec_env orelse env;
             const e = try self.alloc.create(ast.Expr);
-            if (g.rest.items.len > 0) {
+            if (g.value_expr != null and g.rest.items.len > 0) {
+                // `{ a = V; a.b = B; }`: the nested binds merge into the
+                // attrset value.  Build `{ b = B; ... } // V` lazily; `//`
+                // errors if V is not an attrset (Nix parity).
+                const rest_ast = try self.alloc.create(ast.Expr);
+                rest_ast.* = .{ .pos = g.pos, .kind = .{ .attrset = .{ .binds = g.rest.items, .recursive = false } } };
+                const op = try self.alloc.create(ast.Expr);
+                op.* = .{ .pos = g.pos, .kind = .{ .op = .{ .kind = .update, .left = rest_ast, .right = g.value_expr.? } } };
+                items[i].value.* = try self.mkThunk(op, item_env, pos);
+            } else if (g.rest.items.len > 0) {
                 e.* = .{ .pos = g.pos, .kind = .{ .attrset = .{ .binds = g.rest.items, .recursive = recursive } } };
                 items[i].value.* = try self.mkThunk(e, item_env, pos);
             } else if (g.inherit_from) |from| {
@@ -1066,7 +1097,7 @@ pub const EvalState = struct {
             self.eq_seen.put(key, {}) catch {};
             defer _ = self.eq_seen.remove(key);
         }
-        if (self.eq_depth > 100000) return false;
+        if (self.eq_depth > 1000000) return error.InfiniteRecursion;
         var av = a;
         var bv = b;
         try self.force(&av);

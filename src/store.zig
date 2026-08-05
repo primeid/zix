@@ -88,8 +88,8 @@ pub const Store = struct {
         const tmp = try std.fmt.allocPrint(self.alloc, "{s}/zix-db.json.tmp", .{self.store_dir});
         try fsutil.writeFile(tmp, w.items);
         const final = try std.fmt.allocPrint(self.alloc, "{s}/zix-db.json", .{self.store_dir});
-        try fsutil.writeFile(final, w.items);
-        _ = &tmp;
+        // Atomic rename so a crash never leaves a truncated database.
+        try fsutil.renameFile(tmp, final);
     }
 
     fn cat(self: *const Store, parts: []const []const u8) ![]u8 {

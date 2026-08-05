@@ -101,6 +101,10 @@ pub fn realpathAlloc(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
     return std.Io.Dir.cwd().realpathAlloc(io, path, alloc);
 }
 
+pub fn renameFile(from: []const u8, to: []const u8) !void {
+    try std.Io.Dir.renameAbsolute(from, to, io);
+}
+
 pub fn makePath(path: []const u8) !void {
     std.Io.Dir.cwd().createDir(io, path, .default_dir) catch |e| switch (e) {
         error.PathAlreadyExists => {},

@@ -305,19 +305,42 @@ pub fn main(init: std.process.Init) !void {
     writeStdout(output.items);
 }
 
+/// Evaluate a build target (file or expression) on the calling context,
+/// exiting on error.
+fn evalTarget(st: *eval.EvalState, target: []const u8, result: *value.Value) eval.EvalError!void {
+    if (zix.fsutil.pathExists(target)) {
+        result.* = try st.importPath(target);
+    } else {
+        const cwd = fsutilRealpathCwd(st.alloc);
+        const vfile = try std.fmt.allocPrint(st.alloc, "{s}/<command-line>", .{cwd});
+        const parsed = try st.parse(target, vfile);
+        result.* = try st.eval(parsed, st.base_env, 0);
+    }
+}
+
 /// Resolve a `zix build` target to a .drv store path: either a path ending
 /// in `.drv`, or a Nix expression/file whose value is a derivation.
 fn resolveDrvPath(st: *eval.EvalState, target: []const u8) ![]const u8 {
     if (std.mem.endsWith(u8, target, ".drv") and zix.fsutil.pathExists(target)) return target;
     var result: value.Value = undefined;
-    if (zix.fsutil.pathExists(target)) {
-        result = st.importPath(target) catch |e| exitEvalError(e, st);
-    } else {
-        const cwd = fsutilRealpathCwd(st.alloc);
-        const vfile = try std.fmt.allocPrint(st.alloc, "{s}/<command-line>", .{cwd});
-        const parsed = st.parse(target, vfile) catch |e| exitEvalError(e, st);
-        result = st.eval(parsed, st.base_env, 0) catch |e| exitEvalError(e, st);
-    }
+    const EvalOnBigStack = struct {
+        st: *eval.EvalState,
+        target: []const u8,
+        ok: bool = false,
+        result: value.Value = .null_,
+        fn run(ctx: *@This()) void {
+            evalTarget(ctx.st, ctx.target, &ctx.result) catch |e| {
+                ctx.ok = false;
+                exitEvalError(e, ctx.st);
+            };
+            ctx.ok = true;
+        }
+    };
+    var ctx = EvalOnBigStack{ .st = st, .target = target };
+    const t = std.Thread.spawn(.{ .stack_size = 1 << 30 }, EvalOnBigStack.run, .{&ctx}) catch return error.OutOfMemory;
+    t.join();
+    if (!ctx.ok) std.process.exit(1);
+    result = ctx.result;
     try st.force(&result);
     if (result != .attrs) {
         std.debug.print("zix: error: 'zix build' target is not a derivation\n", .{});

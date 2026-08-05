@@ -116,7 +116,7 @@ pub fn buildOne(
         if (fsutil.pathExists(o.path)) {
             std.debug.print("zix: warning: output {s} already exists, refusing to build\n", .{o.path});
             step.done = true;
-            continue;
+            return;
         }
     }
 
@@ -140,16 +140,27 @@ pub fn buildOne(
         try argv.append("/proc");
         try argv.append("--tmpfs");
         try argv.append("/tmp");
-        try argv.append("--tmpfs");
-        try argv.append("/run");
         try argv.append("--dev");
         try argv.append("/dev");
-        try argv.append("--bind");
+        // The store is read-only inside the sandbox (a builder must not
+        // tamper with unrelated store objects); only the output paths are
+        // writable.  The build dir is also writable for scratch work.
+        try argv.append("--ro-bind");
         try argv.append(st.store_dir);
         try argv.append(st.store_dir);
         try argv.append("--bind");
         try argv.append(build_dir);
         try argv.append(build_dir);
+        for (drv.outputs) |o| {
+            if (o.path.len > 0) {
+                // bwrap can only bind existing paths: pre-create the output
+                // directories (the builder writes into them).
+                fsutil.makePath(o.path) catch {};
+                try argv.append("--bind");
+                try argv.append(o.path);
+                try argv.append(o.path);
+            }
+        }
         try argv.append("--");
     }
     try argv.append(drv.builder);

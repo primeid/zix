@@ -613,6 +613,7 @@ fn primFindFile(st: *Eval, args: []const *Value, pos: usize) EvalError!Value {
             try st.force(&pathv);
             const p2 = try forceStringNoCtx(st, &pathv, "while evaluating the 'path' attribute");
             const prefix_v = p.attrs.find("prefix");
+            // Nix defaults the prefix to the basename of the path.
             const use: ?[]const u8 = if (prefix_v) |pv2| blk: {
                 var pfv = pv2.*;
                 try st.force(&pfv);
@@ -625,7 +626,17 @@ fn primFindFile(st: *Eval, args: []const *Value, pos: usize) EvalError!Value {
                 }
                 const rest = name[prefix.len + 1 ..];
                 break :blk try std.fs.path.join(st.alloc, &.{ p2, rest });
-            } else p2;
+            } else blk: {
+                // No prefix: the entry matches names that start with the
+                // basename of the path.
+                const base = std.fs.path.basename(p2);
+                if (std.mem.eql(u8, base, name)) break :blk p2;
+                if (std.mem.startsWith(u8, name, base) and name.len > base.len and name[base.len] == '/') {
+                    const rest = name[base.len + 1 ..];
+                    break :blk try std.fs.path.join(st.alloc, &.{ p2, rest });
+                }
+                continue;
+            };
             _ = &use;
             if (use) |u| {
                 if (!fsutil.pathExists(u)) {
@@ -1016,12 +1027,26 @@ fn primReverseList(st: *Eval, args: []const *Value, pos: usize) EvalError!Value 
 const SortCtx = struct {
     st: *Eval,
     fun: Value,
+    err: ?EvalError = null,
 
-    fn lt(ctx: SortCtx, a: *Value, b: *Value) bool {
-        var r = ctx.st.apply(ctx.fun, a, 0) catch return false;
-        r = ctx.st.apply(r, b, 0) catch return false;
-        ctx.st.force(&r) catch return false;
-        return r == .bool_ and r.bool_;
+    fn lt(ctx: *SortCtx, a: *Value, b: *Value) bool {
+        var r = ctx.st.apply(ctx.fun, a, 0) catch |e| {
+            if (ctx.err == null) ctx.err = e;
+            return false;
+        };
+        r = ctx.st.apply(r, b, 0) catch |e| {
+            if (ctx.err == null) ctx.err = e;
+            return false;
+        };
+        ctx.st.force(&r) catch |e| {
+            if (ctx.err == null) ctx.err = e;
+            return false;
+        };
+        if (r != .bool_) {
+            if (ctx.err == null) ctx.err = error.BadType;
+            return false;
+        }
+        return r.bool_;
     }
 };
 
@@ -1030,7 +1055,10 @@ fn primSort(st: *Eval, args: []const *Value, pos: usize) EvalError!Value {
     const fun = args[0].*;
     const list = try forceList(st, args[1], "");
     const out = try st.alloc.dupe(*Value, list);
-    std.mem.sort(*Value, out, SortCtx{ .st = st, .fun = fun }, SortCtx.lt);
+    var ctx = SortCtx{ .st = st, .fun = fun };
+    std.mem.sort(*Value, out, &ctx, SortCtx.lt);
+    // Propagate a comparator error instead of silently sorting incorrectly.
+    if (ctx.err) |e| return e;
     return .{ .list = out };
 }
 

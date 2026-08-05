@@ -8,6 +8,21 @@ Legend for effort: **S** = small (≤ 1 day), **M** = medium (2–5 days),
 **L** = large (1–2 weeks), **XL** = > 2 weeks. All sizes are for one
 experienced contributor.
 
+## Status at a glance
+
+| Area | Status |
+|---|---|
+| Language (full grammar, laziness, scoping) | ✅ Done — verified against nix |
+| All 107 builtins | ✅ Done |
+| Derivations & store paths (byte-identical) | ✅ Done |
+| `zix build` (planning, execution, fixed-output checks, multi-output) | ✅ Done |
+| Sandboxing (`--sandbox`, bubblewrap) | ✅ Done |
+| `zix gc`, CLI flags (`--json`, `-A`, `--arg`, `--impure`, ...) | ✅ Done |
+| Fuzzing, hardening, docs, CI (3 OSes) | ✅ Done |
+| `import <nixpkgs> {}` full bootstrap | ✅ Done (`pkgs.hello.name = "hello-2.12.3"`) |
+| `zix build (import <nixpkgs> {}).hello` end-to-end | 🔜 Next — the one remaining milestone before 1.0 |
+| Flakes, binary-cache substitution | 📋 After 1.0 (see open decisions) |
+
 ---
 
 ## Phase 0 — Foundations and test infrastructure

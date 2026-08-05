@@ -1,34 +1,73 @@
-# ZIX — The Nix language in Zig
+# ZIX — The Nix language, in Zig
 
 [![CI](https://github.com/primeid/zix/actions/workflows/ci.yml/badge.svg)](https://github.com/primeid/zix/actions/workflows/ci.yml)
 [![Zig](https://img.shields.io/badge/Zig-0.16.0-f7a41d?logo=zig&logoColor=white)](https://ziglang.org)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Lines of code](https://img.shields.io/badge/zig-~9.5k%20lines-38bdf8)](src)
+[![Nix parity](https://img.shields.io/badge/nix%20parity-2.34.7-green)](https://github.com/primeid/zix/blob/main/tests/nix-vs-zix.sh)
 
-> **The Nix expression language, reimplemented in Zig — bit-for-bit compatible with Nix 2.34.**
+> **An independent implementation of the Nix expression language in Zig —
+> bit-for-bit compatible with Nix 2.34.7.**
 
-ZIX is an independent implementation of the **Nix expression language** in
-[Zig](https://ziglang.org) 0.16. It evaluates Nix expressions and produces
-store paths, `.drv` files and derivation attributes that are **identical** to
-what the real `nix` produces — every single path result is verified against
-Nix 2.34.7.
+ZIX evaluates Nix expressions and produces store paths, `.drv` files and
+derivation attributes that are **identical** to what real `nix` produces.
+Every result is verified against real Nix 2.34.7 in CI.
 
-**What makes ZIX interesting:**
-- 🎯 **Compatibility as a testable property** — tests compare against real Nix output.
-- ⚡ **Fast** — a 50 000-element `foldl'` in ~80 ms; a lazy evaluator with memoized thunks.
-- 🔍 **Small and readable codebase** — ~9 000 lines of Zig, zero runtime dependencies.
-- 🧩 **Built from Nix's own source** — the algorithms are modeled directly on
-  `path.cc`, `derivations.cc`, `parser.y`, `lexer.l` with exactly the same semantics.
+## Why ZIX?
 
----
+- 🎯 **Compatibility is a testable property.** A 165-expression battery runs
+  every case in both `zix` and real `nix` and requires identical output —
+  language, builtins, and derivation store paths.
+- ⚡ **Fast.** A 50 000-element `foldl'` evaluates in ~80 ms; a lazy evaluator
+  with memoized thunks and cycle detection.
+- 🔍 **Small and readable.** ~9 500 lines of Zig, zero runtime dependencies,
+  no generated code.
+- 🧩 **Faithful to the original.** Algorithms are modeled directly on Nix's
+  own `parser.y`, `lexer.l`, `derivations.cc`, `store-dir-config.cc`,
+  `archive.cc` and `hash.cc`.
 
-## Building and running
+## Features
 
-Requirements: [Zig 0.16.0](https://ziglang.org/download/) (or `nix develop` for a ready-made environment).
+- **The whole language**: literals, strings + interpolation, indented strings,
+  paths, operators (`+ - * / // ++ == != < > <= >= && || -> ! ?`),
+  attrsets (`inherit`, dynamic attributes, nesting), `let`/`rec`/`with`/
+  `assert`/`if`, lambdas with formals/defaults/`@`-patterns, lists,
+  `<nixpkgs>` lookup, `import`, `scopedImport`.
+- **All 107 Nix 2.34.7 builtins**, including `derivation`/`derivationStrict`,
+  `fetchurl`, `fetchTarball`, `fetchzip`, `fetchGit`, `fetchTree`,
+  `fromTOML`, `toXML`, `hashString` (md5/sha1/sha256/sha512), regex
+  (`match`/`split`, POSIX classes, capture groups), JSON, `placeholder`,
+  `__structuredAttrs`, `tryEval`, `genericClosure` and more.
+- **Derivations**: input-addressed, fixed-output (flat + recursive),
+  multi-output, content-addressed/floating — `.drv` files and store paths
+  byte-identical to Nix.
+- **`zix build`**: realises derivations (and their inputs) in a writable
+  store, verifies fixed-output hashes, registers outputs in a JSON store
+  database, and supports **sandboxed builds** via bubblewrap (network
+  isolation, read-only store, restricted writes).
+- **`zix gc`**: garbage-collects unreachable store objects.
+- **Pure/impure evaluation** exactly like `nix eval` / `nix eval --impure`.
+
+## Building
+
+Requirements: [Zig 0.16.0](https://ziglang.org/download/) — or `nix develop`
+for a ready-made environment.
 
 ```console
 $ zig build            # builds zig-out/bin/zix (ReleaseSafe by default)
-$ zig build test       # 24 tests, incl. store-path verification against real Nix
+$ zig build test       # 27 unit tests
+$ zig build verify     # nix-vs-zix comparison battery (165 cases, needs `nix`)
+$ zig build lang       # golden language tests
+$ zig build fuzz       # structured fuzzing vs nix
 ```
+
+A static, dependency-free binary is just a target flag away:
+
+```console
+$ zig build -Dtarget=x86_64-linux-musl
+```
+
+## Usage
 
 ```console
 $ zix eval -E '1 + 2 * 3'
@@ -36,220 +75,98 @@ $ zix eval -E '1 + 2 * 3'
 $ zix eval -E 'builtins.map (x: x * x) [1 2 3 4]'
 [ 1 4 9 16 ]
 $ zix eval --read-only -E '(builtins.derivation { name = "t"; system = "x86_64-linux"; builder = "/bin/sh"; }).drvPath' --raw
-/nix/store/k79611g7bg62d41fh6bvm7xpf1dl2x91-testdrv.drv   # = real nix
+/nix/store/k79611g7bg62d41fh6bvm7xpf1dl2x91-testdrv.drv   # identical to real nix
 ```
 
-Options: `--raw` (raw strings), `--read-only` (don't write to the store),
-`--store-dir DIR` (own store, e.g. `/tmp/zs`), `-I path` / `NIX_PATH`
-for `<nixpkgs>` lookup, `zix parse FILE` (lex+parse only).
+| Command | Purpose |
+|---|---|
+| `zix eval [-E EXPR | FILE]` | Evaluate (pure mode by default) |
+| `zix eval --impure` | Allow paths, `currentSystem`, environment (like `nix eval --impure`) |
+| `zix eval --json` | Print the result as JSON |
+| `zix eval -A path` | Select an attribute path from the result |
+| `zix eval --arg name value` / `--argstr` | Pass arguments (file targets) |
+| `zix eval --read-only` | Compute store paths without writing |
+| `zix parse FILE` | Lex + parse only |
+| `zix build [--sandbox] [--dry-run] TARGET` | Realise a derivation (file, expression, or `.drv`) |
+| `zix gc [--delete]` | Garbage-collect unreachable store objects |
+| `--store-dir DIR` | Use a custom store (e.g. `/tmp/zs`) |
+| `-I path`, `NIX_PATH` | Search path for `<nixpkgs>` |
+| `--extra-experimental-features extra-builtins,pipe-operators` | Enable ZIX extensions |
 
-### Building derivations
+### Example
 
 ```console
-$ zix build --store-dir /tmp/zs example.nix     # build a derivation expression
-$ zix build --store-dir /tmp/zs --dry-run x.drv  # show the build plan
+$ zix build --store-dir /tmp/zs examples/hello.nix
+$ zix build --store-dir /tmp/zs --sandbox --dry-run x.drv
 ```
 
-`zix build` realises a derivation (and its inputs) in a writable store
-(`--store-dir`); fixed-output derivations are verified by hash, outputs are
-registered in the store database (`zix-db.json`). The default `/nix/store` is
-usually not writable by the current user — use `--store-dir DIR`.
+## Nix compatibility
 
-Examples live in [`examples/`](examples/).
+ZIX targets **Nix 2.34.7** and verifies the following properties in CI:
+
+- All 165 battery expressions produce identical output (values, errors, and
+  derivation store paths) in `zix` and real `nix`.
+- `builtins.toFile`, input-addressed, fixed-output (flat + recursive) and
+  reference-carrying derivations produce byte-identical store paths.
+- The full `import <nixpkgs> {}` bootstrap evaluates (`pkgs.system`,
+  `pkgs.hello.name = "hello-2.12.3"`).
+
+**Documented deviations** (all opt-in or cosmetic):
+
+- `nixVersion` reports `2.34.7` (the compatibility target).
+- ZIX ships a few extra builtins (`bitNot`, `toUpper`, `toLower`, `take`,
+  `drop`, `reverseList`, `mapAttrs'`) and pipe operators (`|>`, `<|`), hidden
+  behind `--extra-experimental-features` by default — mirroring how Nix gates
+  its own experimental features.
+- `fetchGit`/`fetchTree` hash the full repository (including `.git`), while
+  Nix uses git's tree hash — store paths for *sources* differ; language and
+  derivation behaviour are unaffected.
 
 ## Architecture
 
 | Module | Contents |
 |---|---|
-| `src/lexer.zig` | Tokenization faithful to `lexer.l`: paths, URIs, `"…"` and `''…''` strings with interpolation, comments |
-| `src/parser.zig` | Recursive-descent parser faithful to `parser.y`: the whole grammar, precedence, `stripIndentation` bit-for-bit |
+| `src/lexer.zig` | Tokenization faithful to `lexer.l`: paths, URIs, strings, interpolation |
+| `src/parser.zig` | Recursive-descent parser faithful to `parser.y`: full grammar, precedence, `stripIndentation` |
+| `src/eval.zig` | Lazy evaluator: memoized thunks, `rec`/`let`/`with`, scoping, deep equality, concatenation |
 | `src/value.zig` | Values: int/float/bool/null, strings with derivation context, lists, attrsets, lambdas, thunks |
-| `src/eval.zig` | Lazy evaluator: memoized thunks, `rec`/`let`/`with`, scoping, deep equality, string concatenation |
-| `src/builtins.zig` | ~85 primops: arithmetic, lists, attrsets, strings+regex, JSON, files/store, `import`, `derivationStrict` + `derivation` wrappers |
-| `src/drv.zig` | `.drv` ATerm serialization/parsing and `hashDerivationModulo` |
-| `src/store.zig` | Store path computation (`makeStorePath`/`makeOutputPath`/`makeFixedOutputPath`/`makeTextPath`), NAR serialization |
-| `src/nixhash.zig` | SHA-256, base16, Nix base32 ("nix32"), hash compression |
+| `src/builtins.zig` | All 107 primops |
+| `src/drv.zig` | `.drv` ATerm serialization and `hashDerivationModulo` |
+| `src/store.zig` | Store path computation, NAR serialization, store database |
+| `src/nixhash.zig` | SHA-256, md5, sha1, sha512, base16, Nix base32 |
+| `src/build.zig` | Realisation: planning, builder execution, sandboxing |
+| `src/fsutil.zig` | Portable filesystem helpers |
 
-All hashing and path logic is modeled directly on the Nix source
-(`path.cc`, `store-dir-config.cc`, `derivations.cc`, `hash.cc`, `archive.cc`,
-`parser.y`, `lexer.l`) and verified against `nix 2.34.7` on this machine:
-`builtins.toFile`, input-addressed derivations, fixed-output
-(flat + recursive) and derivations with input references produce exactly the
-same store paths.
-
-## Status
-
-**Done and verified against Nix 2.34.7:**
-
-- **The whole language**: literals, strings/interpolation, indented strings,
-  paths, operators (`+ - * / // ++ == != < > <= >= && || -> ! ?`), attrsets
-  (incl. `inherit`, dynamic attributes, nesting), `let`/`rec`/`with`/
-  `assert`/`if`, lambdas with formals/defaults/`@`, lists,
-  `<nixpkgs>` lookup, `import`.
-- **Lazy evaluation** with memoization, cycle detection and deep-recursion protection.
-- **Derivations**: `builtins.derivation`/`derivationStrict` → correct
-  `.drv` files and `drvPath`/`outPath` (input-addressed, fixed-output flat+recursive,
-  multi-output).
-- **~85 builtins**: `map`, `foldl'`, regex (`match`/`split`), `replaceStrings`,
-  `compareVersions`, JSON, `hashString`, `toFile`, `readFile`, `readDir`,
-  `path`, `placeholder`, `tryEval`, `genericClosure` and much more.
-
-**Verification methodology:** a comparison battery of 165 expressions runs
-each expression in both `zix` and real `nix 2.34.7` and requires identical
-results — language, builtins and derivation paths. See
-[CONTRIBUTING](CONTRIBUTING.md) for how to run it yourself.
+Deeper write-ups: [architecture](docs/architecture.md), [store format](docs/store.md).
 
 ## Roadmap
 
-The big picture — a detailed, phased plan with milestones and verification
-criteria lives in **[ROADMAP.md](ROADMAP.md)**. The short version:
+The detailed phased plan lives in **[ROADMAP.md](ROADMAP.md)**. Short version:
 
-- [ ] **The realisation layer** (`zix build`): run builders (sandboxed, on
-      POSIX) and produce outputs. Evaluation is complete; execution remains.
-- [ ] **More builtins**: `fetchGit`, `fetchTarball`, `fetchurl`, `fromTOML`,
-      `__structuredAttrs`, `builtins.path` flags, `scopedImport`,
-      dynamic derivations.
-- [ ] **Nixpkgs evaluation**: `import <nixpkgs> {}` at full scale (milestone:
-      `zix build (import <nixpkgs> {}).hello`).
-- [ ] **Position tracking** in the AST (Nix-style error messages and
-      `«lambda @ «file»:line:col»` output).
-
-Ideally as a [contribution](CONTRIBUTING.md) — Phase 4 (positions) is the best
-starting point for new contributors.
-
-## Known deviations from Nix
-
-Conscious and documented differences:
-
-- **Extra builtins** that Nix 2.34 lacks: `bitNot`, `toUpper`, `toLower`,
-  `take`, `drop`, `reverseList`, `currentSystem` — compatibility-friendly extensions.
-- **`|>` / `<|`** (pipe operators) are enabled by default; Nix requires
-  `--extra-experimental-features pipe-operators`.
-- **Error messages** behave the same (the same cases fail), but the text is
-  often shorter than Nix's.
-- `nixVersion` reports `2.34.7` (for compatibility), `langVersion` = 6.
+- ✅ Phases 0–5 of the core (language, builtins, derivations, build,
+  sandbox, gc, fuzzing, docs) — done and CI-green on 3 OSes.
+- 🔜 Beyond 1.0: flakes, binary-cache substitution, a full nixpkgs
+  `zix build (import <nixpkgs> {}).hello` end-to-end.
 
 ## Contributing
 
-ZIX is a small project that depends on its contributors. Interested in
-language implementations, Zig, Nix, or just think this is fun?
+ZIX is a small project that depends on its contributors. Whether you are into
+language implementation, Zig, Nix, or just think this is fun — there is a
+place for you.
 
-- Check [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines and concrete tasks.
-- Read [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
-- See [Roadmap](#roadmap) for what matters most.
-- Issues and PRs are welcome — small, focused changes with tests move fastest.
+- [CONTRIBUTING.md](CONTRIBUTING.md) — guidelines, testing workflow, concrete tasks.
+- [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) — be kind.
+- [SECURITY.md](SECURITY.md) — how to report vulnerabilities.
+- [CHANGELOG.md](CHANGELOG.md) — what changed.
+- [Issues](https://github.com/primeid/zix/issues) and
+  [PRs](https://github.com/primeid/zix/pulls) are welcome — small, focused
+  changes with tests move fastest.
 
-## Analysis: why (and why not) rewrite Nix in Zig
+## Background
 
-The following is a walkthrough of the benefits, costs and risks of rewriting
-the Nix language/implementation from C++/OCaml to Zig — included in full.
-
-If you mean **rewriting the Nix language or the Nix evaluator/implementation from C++/OCaml to Zig**, there are several possible benefits, but also significant costs.
-
-### Possible benefits of Zig
-
-| Area | Potential benefit |
-| ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
-| **Performance** | Low overhead and good control over memory and data structures can give faster evaluation and lower resource usage. |
-| **Memory usage** | Explicit memory management and allocators make it possible to optimize memory consumption more precisely. |
-| **Simpler codebase** | Zig is a relatively small and consistent language compared with C++ and can reduce the complexity of the implementation. |
-| **Portability** | Zig has excellent cross-compilation and can make it easier to build Nix components for Linux, macOS, Windows and other platforms. |
-| **C interoperability** | Zig integrates directly with C libraries without needing an extensive FFI layer. This is relevant to Nix's existing ecosystem. |
-| **Error handling** | Zig has explicit error handling, which can make critical parts of the evaluator and build-system code easier to follow. |
-| **Fewer dependencies** | The Zig compiler is relatively self-contained and can potentially make bootstrap and distribution simpler. |
-| **Safety** | Although Zig is not memory-safe in the same way as Rust, the language offers better tools for catching certain bugs than traditional C/C++. |
-| **Developer productivity** | A smaller, more modern language model can make it easier for new developers to contribute than a large C++ codebase. |
-
-### The biggest potential win
-
-I believe the most interesting benefit is not necessarily **raw performance**, but **maintainability and portability**.
-
-Nix is in practice several things at once:
-
-```text
-Nix language
-     │
-     ▼
-Parser
-     │
-     ▼
-AST / evaluator
-     │
-     ▼
-Derivations
-     │
-     ▼
-Store / builds
-     │
-     ▼
-Sandboxing
-     │
-     ▼
-Binary caches / deployment
-```
-
-If the core implementation were written in Zig, one could potentially get a **smaller, more homogeneous and more easily portable runtime**. That could make it easier to run Nix components on more platforms and build them from source.
-
-### But: Zig does not necessarily solve Nix's biggest problems
-
-It is important to distinguish between:
-
-**The Nix language as a language**
-and
-**Nix as a complete system**.
-
-If the problem is, for example:
-
-* slow evaluation
-* poor error handling
-* a complicated codebase
-* difficult debugging
-* poor Windows support
-* high resource usage
-
-Zig can potentially help.
-
-But if the problem is:
-
-* the complexity of the Nix expression language
-* laziness
-* hermetic builds
-* dependency graphs
-* reproducibility
-* flakes
-* UX
-* the enormous complexity of Nixpkgs
-
-then a rewrite in Zig will **not automatically solve this**. The problems are simply moved to a new implementation.
-
-### My assessment
-
-If the goal were to modernize Nix, I would **not rewrite all of Nix in Zig from day one**. I would consider a gradual architecture:
-
-```text
-              Existing Nix
-                   │
-        ┌──────────┴──────────┐
-        │                     │
-   Existing code          New Zig components
-                              │
-                    ┌─────────┼─────────┐
-                    │         │         │
-                 Parser    Evaluator   Store
-                    │         │         │
-                    └─────────┴─────────┘
-                              │
-                       Compatibility
-                              │
-                         Nix ecosystem
-```
-
-Then one could first write **a new evaluator in Zig**, benchmark it against today's Nix and gradually replace components if the benefits actually materialize.
-
-**In short:** Zig can potentially give Nix **lower resource usage, easier cross-compilation, a more manageable implementation and better control over runtime performance**. The biggest risk is spending many years rewriting an enormous and complex system without solving the underlying problems that actually make Nix difficult.
-
-If you really mean **rewriting the Nix expression language itself into a new language with Zig as the implementation language**, the analysis is quite different. Then I can also compare **Nix vs. a hypothetical "Zig-Nix"** architecture, including how to preserve backward compatibility with Nixpkgs.
+Why (and why not) rewrite Nix in Zig — a full analysis of the trade-offs, in
+[`docs/analysis-notes.md`](docs/analysis-notes.md).
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT — see [LICENSE](LICENSE). Copyright (c) 2026 Magnus Lislevatn.
